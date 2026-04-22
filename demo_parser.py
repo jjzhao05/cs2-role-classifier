@@ -1,6 +1,3 @@
-#  python demo_parser.py "C:\Users\jjzha\Documents\cs2-role-classifier\demos" output.csv
-#  python demo_parser.py "C:\Users\Jonathan Zhao\Documents\GitHub\cs2-role-classifier\demos" output.csv
-
 from __future__ import annotations
 
 import argparse
@@ -670,34 +667,104 @@ def iter_demo_files(root: Path) -> Iterable[Path]:
         yield path
 
 
+def resolve_input_path(
+    explicit_input: Path | None,
+    use_test: bool,
+    use_main_demos: bool,
+) -> Path:
+    script_dir = Path(__file__).resolve().parent
+
+    if explicit_input is not None:
+        return explicit_input
+
+    if use_test and use_main_demos:
+        raise ValueError("Use only one of --test or --use-main-demos.")
+
+    if use_test:
+        candidates = [
+            script_dir / "demos_test",
+            Path.cwd() / "demos_test",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError("Could not find a 'demos_test' folder next to the script or in the current working directory.")
+
+    if use_main_demos:
+        candidates = [
+            script_dir / "demos",
+            Path.cwd() / "demos",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError("Could not find a 'demos' folder next to the script or in the current working directory.")
+
+    raise ValueError("Provide input_path, or use --test, or use --use-main-demos.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Extract side-split CS2 features from demos.")
-    parser.add_argument("input_path", type=Path, help="Path to a .dem file or folder of .dem files")
+    parser.add_argument(
+        "input_path",
+        nargs="?",
+        type=Path,
+        help="Path to a .dem file or folder of .dem files. Optional if using --test or --use-main-demos.",
+    )
     parser.add_argument("output_path", type=Path, help="Output .csv or .parquet")
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Use the local 'demos_test' folder for quicker testing.",
+    )
+    parser.add_argument(
+        "--use-main-demos",
+        action="store_true",
+        help="Use the local 'demos' folder automatically.",
+    )
     args = parser.parse_args()
+
+    input_path = resolve_input_path(
+        explicit_input=args.input_path,
+        use_test=args.test,
+        use_main_demos=args.use_main_demos,
+    )
+
+    print(f"[info] input path: {input_path}")
+
+    demo_files = list(iter_demo_files(input_path))
+    total = len(demo_files)
+
+    if total == 0:
+        raise RuntimeError(f"No demo files found in: {input_path}")
+
+    print(f"[info] found {total} demos to process\n")
 
     rows: list[pl.DataFrame] = []
     failures: list[tuple[str, str]] = []
 
-    for demo_path in iter_demo_files(args.input_path):
+    for i, demo_path in enumerate(demo_files, start=1):
         try:
-            print(f"[parse] {demo_path}")
+            print(f"[{i}/{total}] parsing: {demo_path}")
             rows.append(compute_player_map_rows(demo_path))
         except Exception as exc:
             failures.append((str(demo_path), repr(exc)))
-            print(f"[skip] {demo_path}: {exc}")
+            print(f"[skip {i}/{total}] {demo_path}: {exc}")
 
     if not rows:
         raise RuntimeError("No demos parsed successfully.")
 
     out = pl.concat(rows, how="diagonal_relaxed")
 
+    args.output_path.parent.mkdir(parents=True, exist_ok=True)
+
     if args.output_path.suffix.lower() == ".csv":
         out.write_csv(args.output_path)
     else:
         out.write_parquet(args.output_path)
 
-    print(f"Wrote {out.height} rows to {args.output_path}")
+    print(f"\nWrote {out.height} rows to {args.output_path}")
+    print(f"[summary] success={len(rows)}, failed={len(failures)}, total={total}")
 
     if failures:
         print("\nFailures:")
