@@ -6,13 +6,9 @@ import matplotlib.pyplot as plt
 
 
 INPUT_DIR = Path("outputs")
+ASSIGNMENTS_DIR = INPUT_DIR / "assignments"
+SUMMARIES_DIR = INPUT_DIR / "summaries"
 PLOTS_DIR = Path("plots")
-
-METHODS = [
-    "kmeans",
-    "gmm",
-    "hdbscan",
-]
 
 RADAR_FEATURES = [
     "opening_attempts_per_round_T",
@@ -77,6 +73,7 @@ def make_radar(ax, values, categories, title):
     n = len(categories)
     angles = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
     vals = values.tolist()
+
     vals += vals[:1]
     angles += angles[:1]
 
@@ -147,20 +144,25 @@ def plot_radar(summary: pd.DataFrame, method_name: str, output_dir: Path) -> Non
 def main():
     PLOTS_DIR.mkdir(exist_ok=True)
 
-    for method in METHODS:
-        players_path = INPUT_DIR / f"{method}_players.csv"
-        summary_path = INPUT_DIR / f"{method}_summary.csv"
+    if not ASSIGNMENTS_DIR.exists():
+        print(f"[skip] missing assignments directory: {ASSIGNMENTS_DIR}")
+        return
 
-        if not players_path.exists():
-            print(f"[skip] missing {players_path}")
-            continue
+    player_files = sorted(ASSIGNMENTS_DIR.glob("*_players.csv"))
+    if not player_files:
+        print(f"[skip] no player assignment files found in {ASSIGNMENTS_DIR}")
+        return
+
+    for players_path in player_files:
+        method_name = players_path.stem.replace("_players", "")
+        summary_path = SUMMARIES_DIR / f"{method_name}_summary.csv"
 
         players = pd.read_csv(players_path)
-        plot_pca_scatter(players, method, PLOTS_DIR)
+        plot_pca_scatter(players, method_name, PLOTS_DIR)
 
         if summary_path.exists():
             summary = pd.read_csv(summary_path)
-            plot_radar(summary, method, PLOTS_DIR)
+            plot_radar(summary, method_name, PLOTS_DIR)
         else:
             print(f"[skip] missing {summary_path}")
 

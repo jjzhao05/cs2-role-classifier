@@ -1,24 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import polars as pl
 from awpy import Demo
-
-
-def pick_col(df: pl.DataFrame, candidates: Sequence[str], required: bool = True) -> str | None:
-    for c in candidates:
-        if c in df.columns:
-            return c
-    if required:
-        raise KeyError(f"None of the candidate columns exist: {list(candidates)}. Available: {df.columns}")
-    return None
-
-
-def require_columns(df: pl.DataFrame, mapping: dict[str, Sequence[str]]) -> dict[str, str]:
-    return {alias: pick_col(df, cols, required=True) for alias, cols in mapping.items()}
 
 
 TEAM_ALIASES = {
@@ -34,6 +22,26 @@ TEAM_ALIASES = {
 RIFLE_REGEX = r"ak47|m4a1|m4a1_silencer|aug|sg556|galilar|famas"
 PISTOL_REGEX = r"glock|usp|usp_silencer|p2000|p250|deagle|elite|fiveseven|tec9|cz75|revolver"
 UTILITY_DAMAGE_REGEX = r"hegrenade|molotov|incendiary|inferno"
+
+TICKRATE = 64.0
+EARLY_ROUND_SECONDS = 20.0
+LATE_ROUND_RATIO = 0.70
+TEAMMATE_NEAR_DISTANCE = 800.0
+PROXIMITY_SAMPLE_STRIDE = 32
+POSITION_BIN_SIZE = 1000.0
+
+
+def pick_col(df: pl.DataFrame, candidates: Sequence[str], required: bool = True) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    if required:
+        raise KeyError(f"None of the candidate columns exist: {list(candidates)}. Available: {df.columns}")
+    return None
+
+
+def require_columns(df: pl.DataFrame, mapping: dict[str, Sequence[str]]) -> dict[str, str]:
+    return {alias: pick_col(df, cols, required=True) for alias, cols in mapping.items()}
 
 
 def normalize_team(value: str | None) -> str | None:
@@ -253,6 +261,171 @@ def map_name_from_demo(demo: Demo, demo_path: Path) -> str:
     return demo_path.stem
 
 
+def build_sampled_proximity_features(alive_ticks: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
+    sampled = (
+        alive_ticks
+        .filter((pl.col("tick") % PROXIMITY_SAMPLE_STRIDE) == 0)
+        .select(["round_num", "tick", "team", "player_name", "x", "y"])
+    )
+
+    left = sampled.select(
+        [
+            "round_num",
+            "tick",
+            "team",
+            "player_name",
+            "x",
+            "y",
+        ]
+    )
+
+    right = sampled.select(
+        [
+            "round_num",
+            "tick",
+            "team",
+            pl.col("player_name").alias("mate_name"),
+            pl.col("x").alias("mate_x"),
+            pl.col("y").alias("mate_y"),
+        ]
+    )
+
+    pairs = (
+        left.join(right, on=["round_num", "tick", "team"], how="inner")
+        .filter(pl.col("player_name") != pl.col("mate_name"))
+        .with_columns(
+            (((pl.col("x") - pl.col("mate_x")) ** 2 + (pl.col("y") - pl.col("mate_y")) ** 2).sqrt()).alias("mate_distance")
+        )
+    )
+
+    nearby_counts = (
+        pairs.group_by(["round_num", "tick", "team", "player_name"])
+        .agg(
+            [
+                (pl.col("mate_distance") <= TEAMMATE_NEAR_DISTANCE).cast(pl.Int64).sum().alias("nearby_teammates"),
+            ]
+        )
+    )
+
+    base = (
+        sampled.join(
+            nearby_counts,
+            on=["round_num", "tick", "team", "player_name"],
+            how="left",
+        )
+        .with_columns(pl.col("nearby_teammates").fill_null(0))
+    )
+
+    sampled_features = (
+        base.group_by([pl.col("player_name"), pl.col("team").alias("side")])
+        .agg(
+            [
+                pl.col("nearby_teammates").mean().alias("avg_nearby_teammates"),
+                (pl.col("nearby_teammates") == 0).cast(pl.Float64).mean().alias("time_spent_alone_ratio"),
+            ]
+        )
+    )
+
+    return sampled_features, base
+
+
+def build_engagement_proximity_features(
+    alive_ticks: pl.DataFrame,
+    first_engagement_events: pl.DataFrame,
+) -> pl.DataFrame:
+    engagement_points = (
+        first_engagement_events
+        .select(
+            [
+                "round_num",
+                pl.col("first_engagement_tick").alias("tick"),
+                "player_name",
+                "side",
+            ]
+        )
+        .join(
+            alive_ticks.select(["round_num", "tick", "player_name", "team", "x", "y"]),
+            left_on=["round_num", "tick", "player_name", "side"],
+            right_on=["round_num", "tick", "player_name", "team"],
+            how="left",
+        )
+    )
+
+    teammates = alive_ticks.select(
+        [
+            "round_num",
+            "tick",
+            "team",
+            pl.col("player_name").alias("mate_name"),
+            pl.col("x").alias("mate_x"),
+            pl.col("y").alias("mate_y"),
+        ]
+    )
+
+    engagement_pairs = (
+        engagement_points.join(
+            teammates,
+            left_on=["round_num", "tick", "side"],
+            right_on=["round_num", "tick", "team"],
+            how="left",
+        )
+        .filter(pl.col("player_name") != pl.col("mate_name"))
+        .with_columns(
+            (((pl.col("x") - pl.col("mate_x")) ** 2 + (pl.col("y") - pl.col("mate_y")) ** 2).sqrt()).alias("mate_distance")
+        )
+    )
+
+    per_engagement = (
+        engagement_pairs.group_by(["round_num", "tick", "player_name", "side"])
+        .agg(
+            (pl.col("mate_distance") <= TEAMMATE_NEAR_DISTANCE).cast(pl.Int64).sum().alias("nearby_teammates_at_engagement")
+        )
+    )
+
+    return (
+        per_engagement.group_by(["player_name", "side"])
+        .agg(
+            [
+                pl.col("nearby_teammates_at_engagement").mean().alias("avg_nearby_teammates_at_engagement"),
+                (pl.col("nearby_teammates_at_engagement") == 0).cast(pl.Float64).mean().alias("engagement_isolation_rate"),
+            ]
+        )
+    )
+
+
+def build_position_entropy_features(alive_ticks: pl.DataFrame) -> pl.DataFrame:
+    sampled = (
+        alive_ticks
+        .filter((pl.col("tick") % PROXIMITY_SAMPLE_STRIDE) == 0)
+        .with_columns(
+            [
+                (pl.col("x") / POSITION_BIN_SIZE).floor().cast(pl.Int64).alias("cell_x"),
+                (pl.col("y") / POSITION_BIN_SIZE).floor().cast(pl.Int64).alias("cell_y"),
+            ]
+        )
+    )
+
+    cell_counts = (
+        sampled.group_by([pl.col("player_name"), pl.col("team").alias("side"), "cell_x", "cell_y"])
+        .agg(pl.len().alias("cell_count"))
+    )
+
+    totals = (
+        cell_counts.group_by(["player_name", "side"])
+        .agg(pl.col("cell_count").sum().alias("total_count"))
+    )
+
+    probs = (
+        cell_counts.join(totals, on=["player_name", "side"], how="left")
+        .with_columns((pl.col("cell_count") / pl.col("total_count")).alias("p"))
+    )
+
+    return (
+        probs.group_by(["player_name", "side"])
+        .agg((-(pl.col("p") * pl.col("p").log())).sum().fill_nan(0).alias("position_entropy"))
+    )
+
+
 def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
     demo = Demo(str(demo_path))
     demo.parse()
@@ -270,6 +443,11 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
             "round_num",
             pl.col("start_tick").alias("round_start_tick"),
             pl.col("end_tick").alias("round_end_tick"),
+        ]
+    ).with_columns(
+        [
+            (pl.col("round_end_tick") - pl.col("round_start_tick")).cast(pl.Float64).alias("round_duration_ticks"),
+            ((pl.col("round_end_tick") - pl.col("round_start_tick")) / TICKRATE).alias("round_duration_seconds"),
         ]
     )
 
@@ -305,6 +483,14 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
             & (pl.col("killer_team") != pl.col("victim_team"))
         )
         .with_columns(pl.col("weapon").cast(pl.Utf8).str.to_lowercase().alias("weapon_lc"))
+        .join(round_starts, on="round_num", how="left")
+        .with_columns(
+            [
+                (pl.col("tick") - pl.col("round_start_tick")).cast(pl.Float64).alias("kill_time_ticks"),
+                ((pl.col("tick") - pl.col("round_start_tick")) / TICKRATE).alias("kill_time_seconds"),
+                ((pl.col("tick") - pl.col("round_start_tick")) / pl.col("round_duration_ticks")).fill_nan(0).alias("kill_time_ratio"),
+            ]
+        )
     )
 
     kills_by_player = kills_clean.group_by([pl.col("killer").alias("player_name"), pl.col("killer_team").alias("side")]).agg(
@@ -314,6 +500,8 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
             pl.col("weapon_lc").str.contains("awp").cast(pl.Int64).sum().alias("awp_kills"),
             pl.col("weapon_lc").str.contains(RIFLE_REGEX).cast(pl.Int64).sum().alias("rifle_kills"),
             pl.col("weapon_lc").str.contains(PISTOL_REGEX).cast(pl.Int64).sum().alias("pistol_kills"),
+            (pl.col("kill_time_seconds") <= EARLY_ROUND_SECONDS).cast(pl.Int64).sum().alias("early_round_kills"),
+            (pl.col("kill_time_ratio") >= LATE_ROUND_RATIO).cast(pl.Int64).sum().alias("late_round_kills"),
         ]
     )
 
@@ -361,7 +549,7 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
     )
 
     first_damage = (
-        damages.filter(pl.col("attacker").is_not_null())
+        damages.filter(pl.col("attacker").is_not_null() & pl.col("attacker_team").is_in(["T", "CT"]))
         .sort(["round_num", "tick"])
         .group_by(["round_num", pl.col("attacker").alias("player_name"), pl.col("attacker_team").alias("side")])
         .first()
@@ -369,20 +557,35 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
     )
 
     first_shot = (
-        shots.filter(pl.col("shooter").is_not_null())
+        shots.filter(pl.col("shooter").is_not_null() & pl.col("shooter_team").is_in(["T", "CT"]))
         .sort(["round_num", "tick"])
         .group_by(["round_num", pl.col("shooter").alias("player_name"), pl.col("shooter_team").alias("side")])
         .first()
         .select(["round_num", "player_name", "side", pl.col("tick").alias("first_shot_tick")])
     )
 
-    engagement_times = (
+    first_engagement_events = (
         first_damage.join(first_shot, on=["round_num", "player_name", "side"], how="full")
         .join(round_starts, on="round_num", how="left")
         .with_columns(pl.min_horizontal(["first_damage_tick", "first_shot_tick"]).alias("first_engagement_tick"))
-        .with_columns((pl.col("first_engagement_tick") - pl.col("round_start_tick")).cast(pl.Float64).alias("engagement_ticks"))
-        .group_by(["player_name", "side"])
-        .agg(pl.col("engagement_ticks").mean().alias("avg_time_to_first_engagement_ticks"))
+        .filter(pl.col("first_engagement_tick").is_not_null())
+        .with_columns(
+            [
+                (pl.col("first_engagement_tick") - pl.col("round_start_tick")).cast(pl.Float64).alias("engagement_ticks"),
+                ((pl.col("first_engagement_tick") - pl.col("round_start_tick")) / TICKRATE).alias("engagement_seconds"),
+            ]
+        )
+        .select(["round_num", "player_name", "side", "first_engagement_tick", "engagement_ticks", "engagement_seconds"])
+    )
+
+    engagement_times = (
+        first_engagement_events.group_by(["player_name", "side"])
+        .agg(
+            [
+                pl.col("engagement_ticks").mean().alias("avg_time_to_first_engagement_ticks"),
+                pl.col("engagement_seconds").mean().alias("avg_time_to_first_engagement_seconds"),
+            ]
+        )
     )
 
     death_ticks = kills_clean.group_by(["round_num", pl.col("victim").alias("player_name"), pl.col("victim_team").alias("side")]).agg(
@@ -396,7 +599,7 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
         .unique()
     )
 
-    survival = (
+    survival_rounds = (
         player_round_presence.join(round_starts, on="round_num", how="left")
         .join(death_ticks, on=["round_num", "player_name", "side"], how="left")
         .with_columns(
@@ -405,13 +608,27 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
                 pl.when(pl.col("death_tick").is_null()).then(pl.col("round_end_tick")).otherwise(pl.col("death_tick")).alias("exit_tick"),
             ]
         )
-        .with_columns((pl.col("exit_tick") - pl.col("round_start_tick")).cast(pl.Float64).alias("survival_ticks"))
-        .group_by(["player_name", "side"])
+        .with_columns(
+            [
+                (pl.col("exit_tick") - pl.col("round_start_tick")).cast(pl.Float64).alias("survival_ticks"),
+                ((pl.col("exit_tick") - pl.col("round_start_tick")) / TICKRATE).alias("survival_seconds"),
+                (
+                    pl.col("exit_tick")
+                    >= (pl.col("round_start_tick") + pl.col("round_duration_ticks") * LATE_ROUND_RATIO)
+                ).cast(pl.Int8).alias("late_round_presence_flag"),
+            ]
+        )
+    )
+
+    survival = (
+        survival_rounds.group_by(["player_name", "side"])
         .agg(
             [
                 pl.col("survival_ticks").mean().alias("avg_survival_ticks"),
                 pl.col("survival_ticks").std().fill_null(0).alias("std_survival_ticks"),
+                pl.col("survival_seconds").mean().alias("avg_survival_seconds"),
                 pl.col("survived_round").sum().alias("survived_rounds"),
+                pl.col("late_round_presence_flag").sum().alias("late_round_presence_rounds"),
             ]
         )
     )
@@ -449,7 +666,7 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
         ]
     )
 
-    trade_window = 5 * 64
+    trade_window = 5 * TICKRATE
 
     trade_pairs = (
         candidate_trades.join(teammate_deaths, on=["round_num", "side"], how="inner")
@@ -511,6 +728,10 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
         .agg(pl.col("isolated_flag").mean().alias("isolation_rate"))
     )
 
+    sampled_proximity_features, _sampled_ticks = build_sampled_proximity_features(alive_ticks)
+    engagement_proximity_features = build_engagement_proximity_features(alive_ticks, first_engagement_events)
+    position_entropy_features = build_position_entropy_features(alive_ticks)
+
     df = players.join(rounds_per_player, on=["player_name", "side"], how="left")
 
     for piece in [
@@ -530,6 +751,9 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
         trade_attempts,
         pos_by_player,
         isolation,
+        sampled_proximity_features,
+        engagement_proximity_features,
+        position_entropy_features,
     ]:
         join_keys = [k for k in ["player_name", "side"] if k in piece.columns and k in df.columns]
         if join_keys:
@@ -553,10 +777,20 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
             .otherwise(0.0)
             .alias("survival_rate"),
 
+            pl.when(pl.col("rounds_played") > 0)
+            .then(pl.col("late_round_presence_rounds") / pl.col("rounds_played"))
+            .otherwise(0.0)
+            .alias("late_round_presence_rate"),
+
             pl.when(pl.col("trade_attempts") > 0)
             .then(pl.col("trade_kills") / pl.col("trade_attempts"))
             .otherwise(0.0)
             .alias("trade_success_rate"),
+
+            pl.when(pl.col("rounds_played") > 0)
+            .then((pl.col("trade_kills") + pl.col("traded_deaths")) / pl.col("rounds_played"))
+            .otherwise(0.0)
+            .alias("trade_participation_rate"),
 
             pl.when(pl.col("kills") > 0)
             .then(pl.col("headshot_kills") / pl.col("kills"))
@@ -582,6 +816,11 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
 
     df = df.with_columns(
         [
+            (pl.col("opening_kills") / pl.col("rounds_played")).fill_nan(0).alias("first_kill_rate"),
+            (pl.col("opening_deaths") / pl.col("rounds_played")).fill_nan(0).alias("first_death_rate"),
+            ((pl.col("opening_kills") + pl.col("opening_deaths")) / pl.col("rounds_played")).fill_nan(0).alias("entry_attempt_rate"),
+            pl.col("opening_success_rate").fill_nan(0).alias("entry_success_rate"),
+
             (pl.col("opening_kills") / pl.col("rounds_played")).fill_nan(0).alias("opening_kills_per_round"),
             ((pl.col("opening_kills") + pl.col("opening_deaths")) / pl.col("rounds_played")).fill_nan(0).alias("opening_attempts_per_round"),
             ((pl.col("opening_kills") + pl.col("opening_deaths")) / pl.col("rounds_played")).fill_nan(0).alias("opening_duels_per_round"),
@@ -591,12 +830,18 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
             (pl.col("assists_raw") / pl.col("rounds_played")).fill_nan(0).alias("assists_per_round"),
             (pl.col("flash_assists") / pl.col("rounds_played")).fill_nan(0).alias("flash_assists_per_round"),
 
+            (pl.col("early_round_kills") / pl.col("rounds_played")).fill_nan(0).alias("early_round_kill_rate"),
+            (pl.col("late_round_kills") / pl.col("rounds_played")).fill_nan(0).alias("late_round_kill_rate"),
+
             (pl.col("hp_damage_total") / pl.col("rounds_played")).fill_nan(0).alias("hp_damage_per_round"),
             (pl.col("armor_damage_total") / pl.col("rounds_played")).fill_nan(0).alias("armor_damage_per_round"),
             (pl.col("utility_damage_total") / pl.col("rounds_played")).fill_nan(0).alias("utility_damage_per_round"),
 
             pl.col("avg_time_to_first_engagement_ticks").fill_nan(0).alias("avg_time_to_first_engagement_ticks"),
+            pl.col("avg_time_to_first_engagement_seconds").fill_nan(0).alias("avg_time_to_first_engagement_seconds"),
+
             pl.col("avg_survival_ticks").fill_nan(0).alias("avg_survival_ticks"),
+            pl.col("avg_survival_seconds").fill_nan(0).alias("avg_survival_seconds"),
             pl.col("std_survival_ticks").fill_nan(0).alias("std_survival_ticks"),
 
             (pl.col("trade_kills") / pl.col("kills")).fill_nan(0).alias("trade_kill_rate"),
@@ -611,40 +856,69 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
 
             pl.col("avg_distance_from_team").fill_nan(0).alias("avg_distance_from_team"),
             pl.col("isolation_rate").fill_nan(0).alias("isolation_rate"),
+
+            pl.col("avg_nearby_teammates").fill_nan(0).alias("avg_nearby_teammates"),
+            pl.col("time_spent_alone_ratio").fill_nan(0).alias("time_spent_alone_ratio"),
+            pl.col("avg_nearby_teammates_at_engagement").fill_nan(0).alias("avg_nearby_teammates_at_engagement"),
+            pl.col("engagement_isolation_rate").fill_nan(0).alias("engagement_isolation_rate"),
+            pl.col("position_entropy").fill_nan(0).alias("position_entropy"),
         ]
     )
 
     feature_cols = [
+        "first_kill_rate",
+        "first_death_rate",
+        "entry_attempt_rate",
+        "entry_success_rate",
+        "early_round_kill_rate",
+        "late_round_kill_rate",
+        "late_round_presence_rate",
+
         "opening_kills_per_round",
         "opening_attempts_per_round",
         "opening_duels_per_round",
         "opening_success_rate",
+
         "kills_per_round",
         "deaths_per_round",
         "assists_per_round",
         "flash_assists_per_round",
+
         "hp_damage_per_round",
         "armor_damage_per_round",
         "utility_damage_per_round",
+
         "headshot_rate",
         "awp_kill_share",
         "rifle_kill_share",
         "pistol_kill_share",
+
         "avg_time_to_first_engagement_ticks",
+        "avg_time_to_first_engagement_seconds",
         "avg_survival_ticks",
+        "avg_survival_seconds",
         "std_survival_ticks",
         "survival_rate",
+
         "trade_kill_rate",
         "trade_kills_per_round",
         "traded_deaths_per_round",
         "trade_attempts_per_round",
         "trade_success_rate",
+        "trade_participation_rate",
+
         "grenades_per_round",
         "flashbangs_per_round",
         "smokes_per_round",
         "fire_nades_per_round",
+
         "avg_distance_from_team",
         "isolation_rate",
+        "avg_nearby_teammates",
+        "time_spent_alone_ratio",
+        "avg_nearby_teammates_at_engagement",
+        "engagement_isolation_rate",
+        "position_entropy",
     ]
 
     df = df.select(["player_name", "map_name", "side", "rounds_played", *feature_cols])
@@ -755,7 +1029,6 @@ def main() -> None:
         raise RuntimeError("No demos parsed successfully.")
 
     out = pl.concat(rows, how="diagonal_relaxed")
-
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.output_path.suffix.lower() == ".csv":
