@@ -141,6 +141,65 @@ def plot_radar(summary: pd.DataFrame, method_name: str, output_dir: Path) -> Non
     plt.close()
 
 
+def plot_k_metrics(results_path: Path, output_dir: Path) -> None:
+    if not results_path.exists():
+        print(f"[skip] missing {results_path}")
+        return
+
+    df = pd.read_csv(results_path)
+
+    if df.empty:
+        print("[skip] clustering results file is empty")
+        return
+
+    # Plot k-based methods
+    k_df = df[df["k"].notna()].copy()
+    if not k_df.empty:
+        k_df["k"] = k_df["k"].astype(int)
+
+    methods = sorted(k_df["method"].dropna().unique()) if not k_df.empty else []
+
+    sil_df = k_df.dropna(subset=["silhouette"]).copy() if not k_df.empty else pd.DataFrame()
+
+    # HDBSCAN reference line
+    hdbscan_df = df[
+        (df["method"] == "hdbscan") &
+        (df["silhouette"].notna())
+    ].copy()
+
+    if sil_df.empty and hdbscan_df.empty:
+        print("[skip] no valid silhouette values found")
+        return
+
+    plt.figure(figsize=(10, 6))
+
+    for method in methods:
+        sub = sil_df[sil_df["method"] == method].sort_values("k")
+        if sub.empty:
+            continue
+        plt.plot(sub["k"], sub["silhouette"], marker="o", label=method)
+
+    if not hdbscan_df.empty:
+        hdb_sil = float(hdbscan_df.iloc[0]["silhouette"])
+        plt.axhline(
+            y=hdb_sil,
+            linestyle="--",
+            linewidth=2,
+            label=f"hdbscan ({hdb_sil:.3f})",
+        )
+
+    plt.xlabel("k")
+    plt.ylabel("Silhouette Score")
+    plt.title("Silhouette Score vs k")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(output_dir / "silhouette_vs_k.png", dpi=200)
+    plt.close()
+
+    print("[ok] saved silhouette_vs_k.png")
+
+
 def main():
     PLOTS_DIR.mkdir(exist_ok=True)
 
@@ -165,6 +224,11 @@ def main():
             plot_radar(summary, method_name, PLOTS_DIR)
         else:
             print(f"[skip] missing {summary_path}")
+
+    plot_k_metrics(
+        INPUT_DIR / "clustering_method_comparison.csv",
+        PLOTS_DIR,
+    )
 
     print(f"\nSaved plots in ./{PLOTS_DIR}")
 
