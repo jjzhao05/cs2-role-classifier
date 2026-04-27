@@ -1,34 +1,44 @@
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import polars as pl
 from awpy import Demo
-
+from awpy.stats import adr, kast, rating, calculate_trades
 
 TEAM_ALIASES = {
-    "t": "T",
-    "terrorist": "T",
-    "terrorists": "T",
-    "ct": "CT",
-    "counterterrorist": "CT",
-    "counterterrorists": "CT",
-    "counter-terrorist": "CT",
+    "t": "t",
+    "terrorist": "t",
+    "terrorists": "t",
+    "ct": "ct",
+    "counterterrorist": "ct",
+    "counterterrorists": "ct",
+    "counter-terrorist": "ct",
 }
 
-RIFLE_REGEX = r"ak47|m4a1|m4a1_silencer|aug|sg556|galilar|famas"
-PISTOL_REGEX = r"glock|usp|usp_silencer|p2000|p250|deagle|elite|fiveseven|tec9|cz75|revolver"
-UTILITY_DAMAGE_REGEX = r"hegrenade|molotov|incendiary|inferno"
-
-TICKRATE = 64.0
-EARLY_ROUND_SECONDS = 20.0
-LATE_ROUND_RATIO = 0.70
-TEAMMATE_NEAR_DISTANCE = 800.0
-PROXIMITY_SAMPLE_STRIDE = 32
-POSITION_BIN_SIZE = 1000.0
+RIFLES = {"ak47", "m4a1", "m4a1_silencer", "aug", "sg556", "galilar", "famas"}
+AWP = {"awp"}
+SMGS = {"mac10", "mp9", "mp7", "mp5sd", "ump45", "p90", "bizon"}
+PISTOLS = {
+    "glock",
+    "usp",
+    "usp_silencer",
+    "p2000",
+    "hkp2000",
+    "p250",
+    "deagle",
+    "elite",
+    "fiveseven",
+    "tec9",
+    "cz75",
+    "cz75a",
+    "revolver",
+}
+SHOTGUNS = {"nova", "xm1014", "mag7", "sawedoff"}
+SCOUT = {"ssg08"}
+UTILITY_KILL_WEAPONS = {"hegrenade", "molotov", "incendiary", "inferno"}
 
 
 def pick_col(df: pl.DataFrame, candidates: Sequence[str], required: bool = True) -> str | None:
@@ -36,7 +46,7 @@ def pick_col(df: pl.DataFrame, candidates: Sequence[str], required: bool = True)
         if c in df.columns:
             return c
     if required:
-        raise KeyError(f"None of the candidate columns exist: {list(candidates)}. Available: {df.columns}")
+        raise KeyError(f"Missing columns: {list(candidates)}. Available: {df.columns}")
     return None
 
 
@@ -48,29 +58,179 @@ def normalize_team(value: str | None) -> str | None:
     if value is None:
         return None
     s = str(value).strip().lower().replace(" ", "").replace("_", "").replace("-", "")
-    return TEAM_ALIASES.get(s, str(value))
+    return TEAM_ALIASES.get(s, str(value).strip().lower())
 
 
-def get_round_table(demo: Demo) -> pl.DataFrame:
-    rounds = demo.rounds
+def normalize_weapon(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return str(value).strip().lower()
+
+
+def categorize_weapon(weapon: str | None) -> str | None:
+    if weapon is None:
+        return None
+    if weapon in RIFLES:
+        return "rifle"
+    if weapon in AWP:
+        return "awp"
+    if weapon in SMGS:
+        return "smg"
+    if weapon in PISTOLS:
+        return "pistol"
+    if weapon in SHOTGUNS:
+        return "shotgun"
+    if weapon in SCOUT:
+        return "scout"
+    if "knife" in weapon:
+        return "knife"
+    return None
+
+
+def map_name_from_demo(demo: Demo, demo_path: Path) -> str:
+    header = getattr(demo, "header", None)
+    if isinstance(header, dict):
+        for key in ("map_name", "map", "mapName"):
+            if key in header and header[key]:
+                return str(header[key])
+    return demo_path.stem
+
+
+def get_player_round_totals_by_side(demo: Demo) -> pl.DataFrame:
+    prt = demo.player_round_totals
     cols = require_columns(
-        rounds,
+        prt,
         {
-            "round_num": ["round_num", "round", "round_number"],
-            "start_tick": ["start_tick", "start", "round_start_tick"],
-            "end_tick": ["end_tick", "end", "round_end_tick"],
+            "player_name": ["name", "player_name"],
+            "side": ["side", "team_side"],
+            "n_rounds": ["n_rounds", "rounds", "rounds_played"],
         },
     )
+
     return (
-        rounds.select(
+        prt.select(
             [
-                pl.col(cols["round_num"]).alias("round_num"),
-                pl.col(cols["start_tick"]).alias("start_tick"),
-                pl.col(cols["end_tick"]).alias("end_tick"),
+                pl.col(cols["player_name"]).cast(pl.Utf8).alias("player_name"),
+                pl.col(cols["side"]).cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("side"),
+                pl.col(cols["n_rounds"]).cast(pl.Int64).alias("rounds_played"),
             ]
         )
-        .unique(subset=["round_num"])
-        .sort("round_num")
+        .filter(pl.col("side").is_in(["t", "ct"]))
+        .group_by(["player_name", "side"])
+        .agg(pl.col("rounds_played").sum().alias("rounds_played"))
+        .sort(["player_name", "side"])
+    )
+
+
+def get_ticks_for_side_lookup(demo: Demo) -> pl.DataFrame:
+    ticks = demo.ticks
+    cols = require_columns(
+        ticks,
+        {
+            "round_num": ["round_num", "round", "round_number"],
+            "tick": ["tick", "game_tick"],
+            "name": ["name", "player_name"],
+            "team": ["team_name", "side", "player_side", "team"],
+        },
+    )
+
+    return (
+        ticks.select(
+            [
+                pl.col(cols["round_num"]).cast(pl.Int64).alias("round_num"),
+                pl.col(cols["tick"]).cast(pl.Int64).alias("tick"),
+                pl.col(cols["name"]).cast(pl.Utf8).alias("player_name"),
+                pl.col(cols["team"]).cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("team"),
+            ]
+        )
+        .filter(pl.col("player_name").is_not_null())
+        .filter(pl.col("team").is_in(["t", "ct"]))
+        .unique(subset=["round_num", "tick", "player_name"])
+    )
+
+
+def get_grenade_events(demo: Demo) -> pl.DataFrame:
+    gren = demo.grenades
+    cols = require_columns(
+        gren,
+        {
+            "entity_id": ["entity_id"],
+            "round_num": ["round_num", "round", "round_number"],
+            "tick": ["tick", "game_tick"],
+            "thrower": ["thrower_name", "player_name", "thrower", "player"],
+            "grenade_type": ["grenade_type", "weapon", "grenade"],
+        },
+    )
+
+    return (
+        gren.select(
+            [
+                pl.col(cols["entity_id"]).alias("entity_id"),
+                pl.col(cols["round_num"]).cast(pl.Int64).alias("round_num"),
+                pl.col(cols["tick"]).cast(pl.Int64).alias("tick"),
+                pl.col(cols["thrower"]).cast(pl.Utf8).alias("thrower"),
+                pl.col(cols["grenade_type"]).cast(pl.Utf8).str.to_lowercase().alias("grenade_type_raw"),
+            ]
+        )
+        .filter(pl.col("thrower").is_not_null())
+        .filter(pl.col("grenade_type_raw").is_not_null())
+        .group_by("entity_id")
+        .agg(
+            [
+                pl.col("round_num").first().alias("round_num"),
+                pl.col("thrower").first().alias("thrower"),
+                pl.col("grenade_type_raw").first().alias("grenade_type_raw"),
+                pl.col("tick").min().alias("start_tick"),
+            ]
+        )
+        .sort(["round_num", "start_tick"])
+    )
+
+
+def normalize_grenade_types(df: pl.DataFrame) -> pl.DataFrame:
+    return (
+        df.with_columns(
+            [
+                pl.when(pl.col("grenade_type_raw").str.contains("flash"))
+                .then(pl.lit("flashbang"))
+                .when(pl.col("grenade_type_raw").str.contains("smoke"))
+                .then(pl.lit("smoke"))
+                .when(pl.col("grenade_type_raw").str.contains(r"(^|[^a-z])he([^a-z]|$)|hegrenade"))
+                .then(pl.lit("hegrenade"))
+                .when(pl.col("grenade_type_raw").str.contains("molotov"))
+                .then(pl.lit("molotov"))
+                .when(pl.col("grenade_type_raw").str.contains("incendiary"))
+                .then(pl.lit("incendiary"))
+                .when(pl.col("grenade_type_raw").str.contains("decoy"))
+                .then(pl.lit("decoy"))
+                .otherwise(pl.lit(None))
+                .alias("grenade_type")
+            ]
+        )
+        .filter(pl.col("grenade_type").is_not_null())
+    )
+
+
+def attach_grenade_side(grenades: pl.DataFrame, ticks_df: pl.DataFrame) -> pl.DataFrame:
+    tick_lookup = (
+        ticks_df.select(
+            [
+                "round_num",
+                pl.col("tick").alias("start_tick"),
+                pl.col("player_name").alias("thrower"),
+                pl.col("team").alias("side"),
+            ]
+        )
+        .unique()
+    )
+
+    return (
+        grenades.join(
+            tick_lookup,
+            on=["round_num", "start_tick", "thrower"],
+            how="left",
+        )
+        .filter(pl.col("side").is_in(["t", "ct"]))
     )
 
 
@@ -100,329 +260,368 @@ def get_kills(demo: Demo) -> pl.DataFrame:
                 "user_side",
             ],
             "weapon": ["weapon", "weapon_name"],
-            "headshot": ["is_headshot", "headshot"],
-            "assister": ["assister_name", "assister"],
-            "assistedflash": ["is_assisted_by_flash", "assistedflash", "flash_assist"],
         },
     )
-    return kills.select(
-        [
-            pl.col(cols["round_num"]).alias("round_num"),
-            pl.col(cols["tick"]).alias("tick"),
-            pl.col(cols["killer"]).cast(pl.Utf8).alias("killer"),
-            pl.col(cols["victim"]).cast(pl.Utf8).alias("victim"),
-            pl.col(cols["killer_team"]).cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("killer_team"),
-            pl.col(cols["victim_team"]).cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("victim_team"),
-            pl.col(cols["weapon"]).cast(pl.Utf8).alias("weapon"),
-            pl.col(cols["headshot"]).cast(pl.Int8).fill_null(0).alias("headshot"),
-            pl.col(cols["assister"]).cast(pl.Utf8).alias("assister"),
-            pl.col(cols["assistedflash"]).cast(pl.Int8).fill_null(0).alias("flash_assist_flag"),
-        ]
+
+    return (
+        kills.select(
+            [
+                pl.col(cols["round_num"]).cast(pl.Int64).alias("round_num"),
+                pl.col(cols["tick"]).cast(pl.Int64).alias("tick"),
+                pl.col(cols["killer"]).cast(pl.Utf8).alias("player_name"),
+                pl.col(cols["victim"]).cast(pl.Utf8).alias("victim"),
+                pl.col(cols["killer_team"]).cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("side"),
+                pl.col(cols["victim_team"]).cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("victim_side"),
+                pl.col(cols["weapon"]).cast(pl.Utf8).map_elements(normalize_weapon, return_dtype=pl.Utf8).alias("weapon"),
+            ]
+        )
+        .filter(pl.col("player_name").is_not_null())
+        .filter(pl.col("victim").is_not_null())
+        .filter(pl.col("side").is_in(["t", "ct"]))
+        .filter(pl.col("victim_side").is_in(["t", "ct"]))
+        .filter(pl.col("side") != pl.col("victim_side"))
+        .filter(pl.col("weapon").is_not_null())
     )
 
 
-def get_damages(demo: Demo) -> pl.DataFrame:
-    damages = demo.damages
+def build_trade_features(demo: Demo, rounds_df: pl.DataFrame, trade_window_seconds: float = 5.0) -> pl.DataFrame:
+    trade_kills_raw = calculate_trades(demo, trade_length_in_seconds=trade_window_seconds)
+
     cols = require_columns(
-        damages,
+        trade_kills_raw,
         {
             "round_num": ["round_num", "round", "round_number"],
             "tick": ["tick", "game_tick"],
-            "attacker": ["attacker_name", "attacker"],
+            "killer": ["killer_name", "attacker_name", "killer", "attacker"],
             "victim": ["victim_name", "user_name", "victim", "user"],
-            "attacker_team": ["attacker_team_name", "attacker_team", "attacker_side"],
-            "victim_team": ["victim_team_name", "user_team_name", "victim_team", "user_team", "victim_side", "user_side"],
-            "hp_damage": ["hp_damage", "dmg_health", "health_damage"],
-            "armor_damage": ["armor_damage", "dmg_armor"],
-            "weapon": ["weapon", "weapon_name"],
-        },
-    )
-    return damages.select(
-        [
-            pl.col(cols["round_num"]).alias("round_num"),
-            pl.col(cols["tick"]).alias("tick"),
-            pl.col(cols["attacker"]).cast(pl.Utf8).alias("attacker"),
-            pl.col(cols["victim"]).cast(pl.Utf8).alias("victim"),
-            pl.col(cols["attacker_team"]).cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("attacker_team"),
-            pl.col(cols["victim_team"]).cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("victim_team"),
-            pl.col(cols["hp_damage"]).cast(pl.Float64).fill_null(0).alias("hp_damage"),
-            pl.col(cols["armor_damage"]).cast(pl.Float64).fill_null(0).alias("armor_damage"),
-            pl.col(cols["weapon"]).cast(pl.Utf8).alias("weapon"),
-        ]
-    )
-
-
-def get_shots(demo: Demo) -> pl.DataFrame:
-    shots = demo.shots
-    cols = require_columns(
-        shots,
-        {
-            "round_num": ["round_num", "round", "round_number"],
-            "tick": ["tick", "game_tick"],
-            "shooter": ["shooter_name", "player_name", "attacker_name", "shooter", "player", "attacker"],
-            "shooter_team": [
-                "shooter_team_name",
-                "player_team_name",
+            "killer_team": [
+                "killer_team_name",
                 "attacker_team_name",
-                "shooter_team",
-                "player_team",
+                "killer_team",
                 "attacker_team",
-                "shooter_side",
-                "player_side",
+                "killer_side",
                 "attacker_side",
             ],
-            "weapon": ["weapon", "weapon_name"],
-        },
-    )
-    return shots.select(
-        [
-            pl.col(cols["round_num"]).alias("round_num"),
-            pl.col(cols["tick"]).alias("tick"),
-            pl.col(cols["shooter"]).cast(pl.Utf8).alias("shooter"),
-            pl.col(cols["shooter_team"]).cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("shooter_team"),
-            pl.col(cols["weapon"]).cast(pl.Utf8).alias("weapon"),
-        ]
-    )
-
-
-def get_ticks(demo: Demo) -> pl.DataFrame:
-    ticks = demo.ticks
-    cols = require_columns(
-        ticks,
-        {
-            "round_num": ["round_num", "round", "round_number"],
-            "tick": ["tick", "game_tick"],
-            "name": ["name", "player_name"],
-            "team": ["team_name", "side", "player_side", "team"],
-            "x": ["X", "x"],
-            "y": ["Y", "y"],
-            "health": ["health", "hp"],
-        },
-    )
-    return ticks.select(
-        [
-            pl.col(cols["round_num"]).alias("round_num"),
-            pl.col(cols["tick"]).alias("tick"),
-            pl.col(cols["name"]).cast(pl.Utf8).alias("player_name"),
-            pl.col(cols["team"]).cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("team"),
-            pl.col(cols["x"]).cast(pl.Float64).alias("x"),
-            pl.col(cols["y"]).cast(pl.Float64).alias("y"),
-            (pl.col(cols["health"]).cast(pl.Float64).fill_null(0) > 0).cast(pl.Int8).alias("is_alive"),
-        ]
-    )
-
-
-def get_grenades(demo: Demo, ticks_df: pl.DataFrame) -> pl.DataFrame:
-    gren = demo.grenades
-    cols = require_columns(
-        gren,
-        {
-            "round_num": ["round_num", "round", "round_number"],
-            "tick": ["tick", "game_tick"],
-            "thrower": ["thrower_name", "player_name", "thrower", "player"],
-            "grenade_type": ["grenade_type", "weapon", "grenade"],
+            "victim_team": [
+                "victim_team_name",
+                "user_team_name",
+                "victim_team",
+                "user_team",
+                "victim_side",
+                "user_side",
+            ],
+            "was_traded": ["was_traded"],
         },
     )
 
-    gren_df = gren.select(
-        [
-            pl.col(cols["round_num"]).alias("round_num"),
-            pl.col(cols["tick"]).alias("tick"),
-            pl.col(cols["thrower"]).cast(pl.Utf8).alias("thrower"),
-            pl.col(cols["grenade_type"]).cast(pl.Utf8).alias("grenade_type"),
-        ]
-    )
-
-    tick_lookup = (
-        ticks_df.select(
+    kills = (
+        trade_kills_raw.select(
             [
+                pl.col(cols["round_num"]).cast(pl.Int64).alias("round_num"),
+                pl.col(cols["tick"]).cast(pl.Int64).alias("tick"),
+                pl.col(cols["killer"]).cast(pl.Utf8).alias("player_name"),
+                pl.col(cols["victim"]).cast(pl.Utf8).alias("victim"),
+                pl.col(cols["killer_team"]).cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("side"),
+                pl.col(cols["victim_team"]).cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("victim_side"),
+                pl.col(cols["was_traded"]).cast(pl.Boolean).alias("was_traded"),
+            ]
+        )
+        .filter(pl.col("player_name").is_not_null())
+        .filter(pl.col("victim").is_not_null())
+        .filter(pl.col("side").is_in(["t", "ct"]))
+        .filter(pl.col("victim_side").is_in(["t", "ct"]))
+        .filter(pl.col("side") != pl.col("victim_side"))
+    )
+
+    # 1) traded deaths:
+    # if A kills B and that kill was_traded=True, then B's death was traded.
+    traded_deaths = (
+        kills.filter(pl.col("was_traded"))
+        .group_by(
+            [
+                pl.col("victim").alias("player_name"),
+                pl.col("victim_side").alias("side"),
+            ]
+        )
+        .agg(pl.len().alias("traded_deaths"))
+    )
+
+    # 2) trade kills:
+    # K2 is a trade kill if its victim is the killer from an earlier K1
+    # in the same round, on the opposite team, within the trade window.
+    first_kills = kills.select(
+        [
+            "round_num",
+            pl.col("tick").alias("first_tick"),
+            pl.col("player_name").alias("first_killer"),
+            pl.col("victim").alias("first_victim"),
+            pl.col("side").alias("first_killer_side"),
+            pl.col("victim_side").alias("first_victim_side"),
+        ]
+    )
+
+    second_kills = kills.select(
+        [
+            "round_num",
+            pl.col("tick").alias("trade_tick"),
+            pl.col("player_name").alias("trade_killer"),
+            pl.col("victim").alias("trade_victim"),
+            pl.col("side").alias("trade_killer_side"),
+            pl.col("victim_side").alias("trade_victim_side"),
+        ]
+    )
+
+    tickrate = getattr(demo, "tickrate", 64)
+    trade_window_ticks = int(round(trade_window_seconds * tickrate))
+
+    trade_kill_events = (
+        second_kills.join(first_kills, on="round_num", how="inner")
+        .filter(pl.col("trade_victim") == pl.col("first_killer"))
+        .filter(pl.col("trade_killer_side") == pl.col("first_victim_side"))
+        .filter(pl.col("trade_victim_side") == pl.col("first_killer_side"))
+        .filter(pl.col("trade_tick") > pl.col("first_tick"))
+        .filter((pl.col("trade_tick") - pl.col("first_tick")) <= trade_window_ticks)
+        .select(
+            [
+                pl.col("trade_killer").alias("player_name"),
+                pl.col("trade_killer_side").alias("side"),
                 "round_num",
-                "tick",
-                pl.col("player_name").alias("thrower"),
-                pl.col("team").alias("thrower_team"),
+                "trade_tick",
             ]
         )
         .unique()
     )
 
-    return gren_df.join(
-        tick_lookup,
-        on=["round_num", "tick", "thrower"],
-        how="left",
+    trade_kills = (
+        trade_kill_events.group_by(["player_name", "side"])
+        .agg(pl.len().alias("trade_kills"))
     )
 
+    joined = rounds_df.join(trade_kills, on=["player_name", "side"], how="left")
+    joined = joined.join(traded_deaths, on=["player_name", "side"], how="left")
+    joined = joined.fill_null(0)
 
-def map_name_from_demo(demo: Demo, demo_path: Path) -> str:
-    header = getattr(demo, "header", None)
-    if isinstance(header, dict):
-        for key in ("map_name", "map", "mapName"):
-            if key in header and header[key]:
-                return str(header[key])
-    return demo_path.stem
-
-
-def build_sampled_proximity_features(alive_ticks: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
-    sampled = (
-        alive_ticks
-        .filter((pl.col("tick") % PROXIMITY_SAMPLE_STRIDE) == 0)
-        .select(["round_num", "tick", "team", "player_name", "x", "y"])
-    )
-
-    left = sampled.select(
+    return joined.with_columns(
         [
-            "round_num",
-            "tick",
-            "team",
+            (pl.col("trade_kills") / pl.col("rounds_played")).fill_nan(0).alias("trade_kills_per_round"),
+            (pl.col("traded_deaths") / pl.col("rounds_played")).fill_nan(0).alias("traded_deaths_per_round"),
+            (pl.col("traded_deaths") / pl.col("rounds_played")).fill_nan(0).alias("death_traded_rate"),
+            (pl.col("trade_kills") + pl.col("traded_deaths")).alias("trade_participation"),
+            ((pl.col("trade_kills") + pl.col("traded_deaths")) / pl.col("rounds_played"))
+            .fill_nan(0)
+            .alias("trade_participation_per_round"),
+        ]
+    ).select(
+        [
             "player_name",
-            "x",
-            "y",
+            "side",
+            "trade_kills",
+            "traded_deaths",
+            "trade_kills_per_round",
+            "traded_deaths_per_round",
+            "death_traded_rate",
+            "trade_participation",
+            "trade_participation_per_round",
         ]
     )
 
-    right = sampled.select(
+
+def build_opening_features(kills_df: pl.DataFrame, rounds_df: pl.DataFrame) -> pl.DataFrame:
+    cols_needed = {"player_name", "victim", "side", "victim_side", "round_num", "tick"}
+    missing = [c for c in cols_needed if c not in kills_df.columns]
+    if missing:
+        raise KeyError(f"build_opening_features missing kill columns: {missing}")
+
+    opening_kills_df = (
+        kills_df.group_by("round_num")
+        .agg(pl.col("tick").min().alias("opening_tick"))
+        .join(kills_df, on="round_num", how="inner")
+        .filter(pl.col("tick") == pl.col("opening_tick"))
+        .sort(["round_num", "tick"])
+        .unique(subset=["round_num"], keep="first")
+    )
+
+    opening_kills = (
+        opening_kills_df.group_by(["player_name", "side"])
+        .agg(pl.len().alias("opening_kills"))
+    )
+
+    opening_deaths = (
+        opening_kills_df.group_by(
+            [
+                pl.col("victim").alias("player_name"),
+                pl.col("victim_side").alias("side"),
+            ]
+        )
+        .agg(pl.len().alias("opening_deaths"))
+    )
+
+    joined = rounds_df.join(opening_kills, on=["player_name", "side"], how="left")
+    joined = joined.join(opening_deaths, on=["player_name", "side"], how="left")
+    joined = joined.fill_null(0).with_columns(
         [
-            "round_num",
-            "tick",
-            "team",
-            pl.col("player_name").alias("mate_name"),
-            pl.col("x").alias("mate_x"),
-            pl.col("y").alias("mate_y"),
+            (pl.col("opening_kills") + pl.col("opening_deaths")).alias("opening_duels"),
         ]
     )
 
-    pairs = (
-        left.join(right, on=["round_num", "tick", "team"], how="inner")
-        .filter(pl.col("player_name") != pl.col("mate_name"))
-        .with_columns(
-            (((pl.col("x") - pl.col("mate_x")) ** 2 + (pl.col("y") - pl.col("mate_y")) ** 2).sqrt()).alias("mate_distance")
-        )
-    )
-
-    nearby_counts = (
-        pairs.group_by(["round_num", "tick", "team", "player_name"])
-        .agg(
-            [
-                (pl.col("mate_distance") <= TEAMMATE_NEAR_DISTANCE).cast(pl.Int64).sum().alias("nearby_teammates"),
-            ]
-        )
-    )
-
-    base = (
-        sampled.join(
-            nearby_counts,
-            on=["round_num", "tick", "team", "player_name"],
-            how="left",
-        )
-        .with_columns(pl.col("nearby_teammates").fill_null(0))
-    )
-
-    sampled_features = (
-        base.group_by([pl.col("player_name"), pl.col("team").alias("side")])
-        .agg(
-            [
-                pl.col("nearby_teammates").mean().alias("avg_nearby_teammates"),
-                (pl.col("nearby_teammates") == 0).cast(pl.Float64).mean().alias("time_spent_alone_ratio"),
-            ]
-        )
-    )
-
-    return sampled_features, base
-
-
-def build_engagement_proximity_features(
-    alive_ticks: pl.DataFrame,
-    first_engagement_events: pl.DataFrame,
-) -> pl.DataFrame:
-    engagement_points = (
-        first_engagement_events
-        .select(
-            [
-                "round_num",
-                pl.col("first_engagement_tick").alias("tick"),
-                "player_name",
-                "side",
-            ]
-        )
-        .join(
-            alive_ticks.select(["round_num", "tick", "player_name", "team", "x", "y"]),
-            left_on=["round_num", "tick", "player_name", "side"],
-            right_on=["round_num", "tick", "player_name", "team"],
-            how="left",
-        )
-    )
-
-    teammates = alive_ticks.select(
+    joined = joined.with_columns(
         [
-            "round_num",
-            "tick",
-            "team",
-            pl.col("player_name").alias("mate_name"),
-            pl.col("x").alias("mate_x"),
-            pl.col("y").alias("mate_y"),
+            (pl.col("opening_kills") / pl.col("rounds_played")).fill_nan(0).alias("opening_kills_per_round"),
+            (pl.col("opening_deaths") / pl.col("rounds_played")).fill_nan(0).alias("opening_deaths_per_round"),
+            (pl.col("opening_duels") / pl.col("rounds_played")).fill_nan(0).alias("opening_duels_per_round"),
+            pl.when(pl.col("opening_duels") > 0)
+            .then(pl.col("opening_kills") / pl.col("opening_duels"))
+            .otherwise(0.0)
+            .alias("opening_duel_success_rate"),
         ]
     )
 
-    engagement_pairs = (
-        engagement_points.join(
-            teammates,
-            left_on=["round_num", "tick", "side"],
-            right_on=["round_num", "tick", "team"],
-            how="left",
-        )
-        .filter(pl.col("player_name") != pl.col("mate_name"))
-        .with_columns(
-            (((pl.col("x") - pl.col("mate_x")) ** 2 + (pl.col("y") - pl.col("mate_y")) ** 2).sqrt()).alias("mate_distance")
-        )
+    return joined.select(
+        [
+            "player_name",
+            "side",
+            "opening_kills",
+            "opening_deaths",
+            "opening_duels",
+            "opening_kills_per_round",
+            "opening_deaths_per_round",
+            "opening_duels_per_round",
+            "opening_duel_success_rate",
+        ]
     )
 
-    per_engagement = (
-        engagement_pairs.group_by(["round_num", "tick", "player_name", "side"])
-        .agg(
-            (pl.col("mate_distance") <= TEAMMATE_NEAR_DISTANCE).cast(pl.Int64).sum().alias("nearby_teammates_at_engagement")
+def build_weapon_category_kills(kills_df: pl.DataFrame, rounds_df: pl.DataFrame) -> pl.DataFrame:
+    categorized = (
+        kills_df.with_columns(
+            pl.col("weapon").map_elements(categorize_weapon, return_dtype=pl.Utf8).alias("weapon_category")
         )
+        .filter(pl.col("weapon_category").is_not_null())
     )
 
-    return (
-        per_engagement.group_by(["player_name", "side"])
+    base = rounds_df.select(["player_name", "side"])
+
+    if categorized.height == 0:
+        return base.with_columns(
+            [
+                pl.lit(0).alias("rifle_kills"),
+                pl.lit(0).alias("awp_kills"),
+                pl.lit(0).alias("smg_kills"),
+                pl.lit(0).alias("pistol_kills"),
+                pl.lit(0).alias("knife_kills"),
+                pl.lit(0).alias("shotgun_kills"),
+                pl.lit(0).alias("scout_kills"),
+                pl.lit(0.0).alias("rifle_kills_per_round"),
+                pl.lit(0.0).alias("awp_kills_per_round"),
+                pl.lit(0.0).alias("smg_kills_per_round"),
+                pl.lit(0.0).alias("pistol_kills_per_round"),
+                pl.lit(0.0).alias("knife_kills_per_round"),
+                pl.lit(0.0).alias("shotgun_kills_per_round"),
+                pl.lit(0.0).alias("scout_kills_per_round"),
+            ]
+        )
+
+    long_counts = (
+        categorized.group_by(["player_name", "side", "weapon_category"])
+        .agg(pl.len().alias("kills"))
+    )
+
+    wide_counts = (
+        long_counts.pivot(
+            values="kills",
+            index=["player_name", "side"],
+            on="weapon_category",
+            aggregate_function="first",
+        )
+        .fill_null(0)
+    )
+
+    rename_map = {}
+    for c in wide_counts.columns:
+        if c not in {"player_name", "side"}:
+            rename_map[c] = f"{c}_kills"
+    wide_counts = wide_counts.rename(rename_map)
+
+    joined = rounds_df.join(wide_counts, on=["player_name", "side"], how="left").fill_null(0)
+
+    required_kill_cols = [
+        "rifle_kills",
+        "awp_kills",
+        "smg_kills",
+        "pistol_kills",
+        "knife_kills",
+        "shotgun_kills",
+        "scout_kills",
+    ]
+    for col_name in required_kill_cols:
+        if col_name not in joined.columns:
+            joined = joined.with_columns(pl.lit(0).alias(col_name))
+
+    joined = joined.with_columns(
+        [
+            (pl.col("rifle_kills") / pl.col("rounds_played")).fill_nan(0).alias("rifle_kills_per_round"),
+            (pl.col("awp_kills") / pl.col("rounds_played")).fill_nan(0).alias("awp_kills_per_round"),
+            (pl.col("smg_kills") / pl.col("rounds_played")).fill_nan(0).alias("smg_kills_per_round"),
+            (pl.col("pistol_kills") / pl.col("rounds_played")).fill_nan(0).alias("pistol_kills_per_round"),
+            (pl.col("knife_kills") / pl.col("rounds_played")).fill_nan(0).alias("knife_kills_per_round"),
+            (pl.col("shotgun_kills") / pl.col("rounds_played")).fill_nan(0).alias("shotgun_kills_per_round"),
+            (pl.col("scout_kills") / pl.col("rounds_played")).fill_nan(0).alias("scout_kills_per_round"),
+        ]
+    )
+
+    return joined.select(
+        [
+            "player_name",
+            "side",
+            "rifle_kills",
+            "awp_kills",
+            "smg_kills",
+            "pistol_kills",
+            "knife_kills",
+            "shotgun_kills",
+            "scout_kills",
+            "rifle_kills_per_round",
+            "awp_kills_per_round",
+            "smg_kills_per_round",
+            "pistol_kills_per_round",
+            "knife_kills_per_round",
+            "shotgun_kills_per_round",
+            "scout_kills_per_round",
+        ]
+    )
+
+
+def build_utility_kills(kills_df: pl.DataFrame, rounds_df: pl.DataFrame) -> pl.DataFrame:
+    util_kills = (
+        kills_df.filter(pl.col("weapon").is_in(UTILITY_KILL_WEAPONS))
+        .group_by(["player_name", "side"])
         .agg(
             [
-                pl.col("nearby_teammates_at_engagement").mean().alias("avg_nearby_teammates_at_engagement"),
-                (pl.col("nearby_teammates_at_engagement") == 0).cast(pl.Float64).mean().alias("engagement_isolation_rate"),
+                pl.len().alias("utility_kills"),
+                (pl.col("weapon") == "hegrenade").cast(pl.Int64).sum().alias("he_kills"),
+                pl.col("weapon").is_in(["molotov", "incendiary", "inferno"]).cast(pl.Int64).sum().alias("fire_kills"),
             ]
         )
     )
 
+    joined = rounds_df.join(util_kills, on=["player_name", "side"], how="left").fill_null(0)
 
-def build_position_entropy_features(alive_ticks: pl.DataFrame) -> pl.DataFrame:
-    sampled = (
-        alive_ticks
-        .filter((pl.col("tick") % PROXIMITY_SAMPLE_STRIDE) == 0)
-        .with_columns(
-            [
-                (pl.col("x") / POSITION_BIN_SIZE).floor().cast(pl.Int64).alias("cell_x"),
-                (pl.col("y") / POSITION_BIN_SIZE).floor().cast(pl.Int64).alias("cell_y"),
-            ]
-        )
-    )
-
-    cell_counts = (
-        sampled.group_by([pl.col("player_name"), pl.col("team").alias("side"), "cell_x", "cell_y"])
-        .agg(pl.len().alias("cell_count"))
-    )
-
-    totals = (
-        cell_counts.group_by(["player_name", "side"])
-        .agg(pl.col("cell_count").sum().alias("total_count"))
-    )
-
-    probs = (
-        cell_counts.join(totals, on=["player_name", "side"], how="left")
-        .with_columns((pl.col("cell_count") / pl.col("total_count")).alias("p"))
-    )
-
-    return (
-        probs.group_by(["player_name", "side"])
-        .agg((-(pl.col("p") * pl.col("p").log())).sum().fill_nan(0).alias("position_entropy"))
+    return joined.with_columns(
+        [
+            (pl.col("utility_kills") / pl.col("rounds_played")).fill_nan(0).alias("utility_kills_per_round"),
+            (pl.col("he_kills") / pl.col("rounds_played")).fill_nan(0).alias("he_kills_per_round"),
+            (pl.col("fire_kills") / pl.col("rounds_played")).fill_nan(0).alias("fire_kills_per_round"),
+        ]
+    ).select(
+        [
+            "player_name",
+            "side",
+            "utility_kills",
+            "he_kills",
+            "fire_kills",
+            "utility_kills_per_round",
+            "he_kills_per_round",
+            "fire_kills_per_round",
+        ]
     )
 
 
@@ -431,500 +630,152 @@ def compute_player_map_rows(demo_path: Path) -> pl.DataFrame:
     demo.parse()
 
     map_name = map_name_from_demo(demo, demo_path)
-    round_table = get_round_table(demo)
-    kills = get_kills(demo)
-    damages = get_damages(demo)
-    shots = get_shots(demo)
-    ticks = get_ticks(demo)
-    grenades = get_grenades(demo, ticks)
 
-    round_starts = round_table.select(
-        [
-            "round_num",
-            pl.col("start_tick").alias("round_start_tick"),
-            pl.col("end_tick").alias("round_end_tick"),
-        ]
-    ).with_columns(
-        [
-            (pl.col("round_end_tick") - pl.col("round_start_tick")).cast(pl.Float64).alias("round_duration_ticks"),
-            ((pl.col("round_end_tick") - pl.col("round_start_tick")) / TICKRATE).alias("round_duration_seconds"),
-        ]
+    rounds_df = get_player_round_totals_by_side(demo)
+    ticks_df = get_ticks_for_side_lookup(demo)
+
+    grenades = get_grenade_events(demo)
+    grenades = normalize_grenade_types(grenades)
+    grenades = attach_grenade_side(grenades, ticks_df)
+
+    kills_df = get_kills(demo)
+    weapon_category_df = build_weapon_category_kills(kills_df, rounds_df)
+    utility_kills_df = build_utility_kills(kills_df, rounds_df)
+    trade_df = build_trade_features(demo, rounds_df, trade_window_seconds=5.0)
+    opening_df = build_opening_features(kills_df, rounds_df)
+
+    adr_df = (
+        adr(demo, team_dmg=True, self_dmg=True)
+        .rename({"name": "player_name"})
+        .with_columns(pl.col("side").cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("side"))
+        .filter(pl.col("side").is_in(["t", "ct"]))
+        .select(["player_name", "side", "adr"])
     )
 
-    round_start_ticks = (
-        ticks.join(round_starts.select(["round_num", "round_start_tick"]), on="round_num", how="left")
-        .filter(pl.col("tick") == pl.col("round_start_tick"))
-        .filter(pl.col("team").is_in(["T", "CT"]))
+    kast_df = (
+        kast(demo)
+        .rename({"name": "player_name"})
+        .with_columns(pl.col("side").cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("side"))
+        .filter(pl.col("side").is_in(["t", "ct"]))
+        .select(["player_name", "side", "kast"])
     )
 
-    players = (
-        round_start_ticks.select([pl.col("player_name"), pl.col("team").alias("side")])
-        .filter(pl.col("player_name").is_not_null())
-        .unique()
-        .sort(["player_name", "side"])
+    rating_df = (
+        rating(demo)
+        .rename({"name": "player_name"})
+        .with_columns(pl.col("side").cast(pl.Utf8).map_elements(normalize_team, return_dtype=pl.Utf8).alias("side"))
+        .filter(pl.col("side").is_in(["t", "ct"]))
+        .select(["player_name", "side", "rating"])
     )
 
-    rounds_per_player = (
-        round_start_ticks
-        .filter(pl.col("is_alive") == 1)
-        .select(["round_num", "player_name", pl.col("team").alias("side")])
-        .unique()
-        .group_by(["player_name", "side"])
-        .agg(pl.len().alias("rounds_played"))
-    )
-
-    kills_clean = (
-        kills.filter(
-            pl.col("killer").is_not_null()
-            & pl.col("victim").is_not_null()
-            & pl.col("killer_team").is_in(["T", "CT"])
-            & pl.col("victim_team").is_in(["T", "CT"])
-            & (pl.col("killer") != pl.col("victim"))
-            & (pl.col("killer_team") != pl.col("victim_team"))
-        )
-        .with_columns(pl.col("weapon").cast(pl.Utf8).str.to_lowercase().alias("weapon_lc"))
-        .join(round_starts, on="round_num", how="left")
-        .with_columns(
-            [
-                (pl.col("tick") - pl.col("round_start_tick")).cast(pl.Float64).alias("kill_time_ticks"),
-                ((pl.col("tick") - pl.col("round_start_tick")) / TICKRATE).alias("kill_time_seconds"),
-                ((pl.col("tick") - pl.col("round_start_tick")) / pl.col("round_duration_ticks")).fill_nan(0).alias("kill_time_ratio"),
-            ]
-        )
-    )
-
-    kills_by_player = kills_clean.group_by([pl.col("killer").alias("player_name"), pl.col("killer_team").alias("side")]).agg(
-        [
-            pl.len().alias("kills"),
-            pl.col("headshot").sum().alias("headshot_kills"),
-            pl.col("weapon_lc").str.contains("awp").cast(pl.Int64).sum().alias("awp_kills"),
-            pl.col("weapon_lc").str.contains(RIFLE_REGEX).cast(pl.Int64).sum().alias("rifle_kills"),
-            pl.col("weapon_lc").str.contains(PISTOL_REGEX).cast(pl.Int64).sum().alias("pistol_kills"),
-            (pl.col("kill_time_seconds") <= EARLY_ROUND_SECONDS).cast(pl.Int64).sum().alias("early_round_kills"),
-            (pl.col("kill_time_ratio") >= LATE_ROUND_RATIO).cast(pl.Int64).sum().alias("late_round_kills"),
-        ]
-    )
-
-    deaths_by_player = kills_clean.group_by([pl.col("victim").alias("player_name"), pl.col("victim_team").alias("side")]).agg(
-        [pl.len().alias("deaths")]
-    )
-
-    assists_by_player = (
-        kills_clean.filter(pl.col("assister").is_not_null())
-        .group_by([pl.col("assister").alias("player_name"), pl.col("killer_team").alias("side")])
-        .agg(pl.len().alias("assists_raw"))
-    )
-
-    flash_assists_by_player = (
-        kills_clean.filter(pl.col("assister").is_not_null() & (pl.col("flash_assist_flag") == 1))
-        .group_by([pl.col("assister").alias("player_name"), pl.col("killer_team").alias("side")])
-        .agg(pl.len().alias("flash_assists"))
-    )
-
-    first_kills = kills_clean.sort(["round_num", "tick"]).group_by("round_num").first()
-
-    opening_killers = first_kills.group_by([pl.col("killer").alias("player_name"), pl.col("killer_team").alias("side")]).agg(
-        pl.len().alias("opening_kills")
-    )
-
-    opening_victims = first_kills.group_by([pl.col("victim").alias("player_name"), pl.col("victim_team").alias("side")]).agg(
-        pl.len().alias("opening_deaths")
-    )
-
-    dmg_by_player = damages.group_by([pl.col("attacker").alias("player_name"), pl.col("attacker_team").alias("side")]).agg(
-        [
-            pl.col("hp_damage").sum().alias("hp_damage_total"),
-            pl.col("armor_damage").sum().alias("armor_damage_total"),
-        ]
-    )
-
-    utility_damage_by_player = (
-        damages.filter(
-            pl.col("attacker").is_not_null()
-            & pl.col("attacker_team").is_in(["T", "CT"])
-            & pl.col("weapon").cast(pl.Utf8).str.to_lowercase().str.contains(UTILITY_DAMAGE_REGEX)
-        )
-        .group_by([pl.col("attacker").alias("player_name"), pl.col("attacker_team").alias("side")])
-        .agg((pl.col("hp_damage").sum() + pl.col("armor_damage").sum()).alias("utility_damage_total"))
-    )
-
-    first_damage = (
-        damages.filter(pl.col("attacker").is_not_null() & pl.col("attacker_team").is_in(["T", "CT"]))
-        .sort(["round_num", "tick"])
-        .group_by(["round_num", pl.col("attacker").alias("player_name"), pl.col("attacker_team").alias("side")])
-        .first()
-        .select(["round_num", "player_name", "side", pl.col("tick").alias("first_damage_tick")])
-    )
-
-    first_shot = (
-        shots.filter(pl.col("shooter").is_not_null() & pl.col("shooter_team").is_in(["T", "CT"]))
-        .sort(["round_num", "tick"])
-        .group_by(["round_num", pl.col("shooter").alias("player_name"), pl.col("shooter_team").alias("side")])
-        .first()
-        .select(["round_num", "player_name", "side", pl.col("tick").alias("first_shot_tick")])
-    )
-
-    first_engagement_events = (
-        first_damage.join(first_shot, on=["round_num", "player_name", "side"], how="full")
-        .join(round_starts, on="round_num", how="left")
-        .with_columns(pl.min_horizontal(["first_damage_tick", "first_shot_tick"]).alias("first_engagement_tick"))
-        .filter(pl.col("first_engagement_tick").is_not_null())
-        .with_columns(
-            [
-                (pl.col("first_engagement_tick") - pl.col("round_start_tick")).cast(pl.Float64).alias("engagement_ticks"),
-                ((pl.col("first_engagement_tick") - pl.col("round_start_tick")) / TICKRATE).alias("engagement_seconds"),
-            ]
-        )
-        .select(["round_num", "player_name", "side", "first_engagement_tick", "engagement_ticks", "engagement_seconds"])
-    )
-
-    engagement_times = (
-        first_engagement_events.group_by(["player_name", "side"])
-        .agg(
-            [
-                pl.col("engagement_ticks").mean().alias("avg_time_to_first_engagement_ticks"),
-                pl.col("engagement_seconds").mean().alias("avg_time_to_first_engagement_seconds"),
-            ]
-        )
-    )
-
-    death_ticks = kills_clean.group_by(["round_num", pl.col("victim").alias("player_name"), pl.col("victim_team").alias("side")]).agg(
-        pl.col("tick").min().alias("death_tick")
-    )
-
-    player_round_presence = (
-        round_start_ticks
-        .filter(pl.col("is_alive") == 1)
-        .select(["round_num", "player_name", pl.col("team").alias("side")])
-        .unique()
-    )
-
-    survival_rounds = (
-        player_round_presence.join(round_starts, on="round_num", how="left")
-        .join(death_ticks, on=["round_num", "player_name", "side"], how="left")
-        .with_columns(
-            [
-                pl.when(pl.col("death_tick").is_null()).then(1).otherwise(0).alias("survived_round"),
-                pl.when(pl.col("death_tick").is_null()).then(pl.col("round_end_tick")).otherwise(pl.col("death_tick")).alias("exit_tick"),
-            ]
-        )
-        .with_columns(
-            [
-                (pl.col("exit_tick") - pl.col("round_start_tick")).cast(pl.Float64).alias("survival_ticks"),
-                ((pl.col("exit_tick") - pl.col("round_start_tick")) / TICKRATE).alias("survival_seconds"),
-                (
-                    pl.col("exit_tick")
-                    >= (pl.col("round_start_tick") + pl.col("round_duration_ticks") * LATE_ROUND_RATIO)
-                ).cast(pl.Int8).alias("late_round_presence_flag"),
-            ]
-        )
-    )
-
-    survival = (
-        survival_rounds.group_by(["player_name", "side"])
-        .agg(
-            [
-                pl.col("survival_ticks").mean().alias("avg_survival_ticks"),
-                pl.col("survival_ticks").std().fill_null(0).alias("std_survival_ticks"),
-                pl.col("survival_seconds").mean().alias("avg_survival_seconds"),
-                pl.col("survived_round").sum().alias("survived_rounds"),
-                pl.col("late_round_presence_flag").sum().alias("late_round_presence_rounds"),
-            ]
-        )
-    )
-
-    utility = (
-        grenades.filter(pl.col("thrower_team").is_in(["T", "CT"]))
-        .group_by([pl.col("thrower").alias("player_name"), pl.col("thrower_team").alias("side")])
+    utility_df = (
+        grenades.group_by([pl.col("thrower").alias("player_name"), "side"])
         .agg(
             [
                 pl.len().alias("grenades_thrown"),
-                (pl.col("grenade_type").str.to_lowercase().str.contains("flash").cast(pl.Int64)).sum().alias("flashbangs_thrown"),
-                (pl.col("grenade_type").str.to_lowercase().str.contains("smoke").cast(pl.Int64)).sum().alias("smokes_thrown"),
-                (pl.col("grenade_type").str.to_lowercase().str.contains("molotov|incendiary").cast(pl.Int64)).sum().alias("fire_nades_thrown"),
+                (pl.col("grenade_type") == "flashbang").cast(pl.Int64).sum().alias("flashbangs_thrown"),
+                (pl.col("grenade_type") == "smoke").cast(pl.Int64).sum().alias("smokes_thrown"),
+                ((pl.col("grenade_type") == "molotov") | (pl.col("grenade_type") == "incendiary"))
+                .cast(pl.Int64)
+                .sum()
+                .alias("fire_nades_thrown"),
+                (pl.col("grenade_type") == "hegrenade").cast(pl.Int64).sum().alias("hegrenades_thrown"),
+                (pl.col("grenade_type") == "decoy").cast(pl.Int64).sum().alias("decoys_thrown"),
             ]
         )
     )
 
-    teammate_deaths = kills_clean.select(
+    df = rounds_df.join(adr_df, on=["player_name", "side"], how="left")
+    df = df.join(kast_df, on=["player_name", "side"], how="left")
+    df = df.join(rating_df, on=["player_name", "side"], how="left")
+    df = df.join(utility_df, on=["player_name", "side"], how="left")
+    df = df.join(weapon_category_df, on=["player_name", "side"], how="left")
+    df = df.join(utility_kills_df, on=["player_name", "side"], how="left")
+    df = rounds_df.join(adr_df, on=["player_name", "side"], how="left")
+    df = df.join(kast_df, on=["player_name", "side"], how="left")
+    df = df.join(rating_df, on=["player_name", "side"], how="left")
+    df = df.join(utility_df, on=["player_name", "side"], how="left")
+    df = df.join(weapon_category_df, on=["player_name", "side"], how="left")
+    df = df.join(utility_kills_df, on=["player_name", "side"], how="left")
+    df = df.join(trade_df, on=["player_name", "side"], how="left")
+    df = df.join(opening_df, on=["player_name", "side"], how="left")
+
+    df = df.fill_null(0).with_columns(
         [
-            "round_num",
-            pl.col("tick").alias("death_tick"),
-            pl.col("victim_team").alias("side"),
-            pl.col("victim").alias("dead_teammate"),
-            pl.col("killer").alias("enemy_killer"),
-        ]
-    )
-
-    candidate_trades = kills_clean.select(
-        [
-            "round_num",
-            pl.col("tick").alias("trade_tick"),
-            pl.col("killer").alias("player_name"),
-            pl.col("killer_team").alias("side"),
-            pl.col("victim").alias("trade_victim"),
-        ]
-    )
-
-    trade_window = 5 * TICKRATE
-
-    trade_pairs = (
-        candidate_trades.join(teammate_deaths, on=["round_num", "side"], how="inner")
-        .filter(
-            (pl.col("trade_victim") == pl.col("enemy_killer"))
-            & (pl.col("trade_tick") > pl.col("death_tick"))
-            & ((pl.col("trade_tick") - pl.col("death_tick")) <= trade_window)
-            & (pl.col("player_name") != pl.col("dead_teammate"))
-        )
-    )
-
-    trade_events = (
-        trade_pairs
-        .sort(["round_num", "death_tick", "trade_tick"])
-        .group_by(["round_num", "death_tick", "side", "dead_teammate", "enemy_killer"])
-        .first()
-    )
-
-    trade_kills = trade_events.group_by(["player_name", "side"]).agg(pl.len().alias("trade_kills"))
-
-    traded_deaths = (
-        trade_events.group_by([pl.col("dead_teammate").alias("player_name"), "side"]).agg(pl.len().alias("traded_deaths"))
-    )
-
-    trade_attempts = (
-        player_round_presence.join(
-            teammate_deaths.select(["round_num", "side", "dead_teammate"]).unique(),
-            on=["round_num", "side"],
-            how="inner",
-        )
-        .filter(pl.col("player_name") != pl.col("dead_teammate"))
-        .group_by(["player_name", "side"])
-        .agg(pl.len().alias("trade_attempts"))
-    )
-
-    alive_ticks = ticks.filter((pl.col("is_alive") == 1) & pl.col("team").is_in(["T", "CT"]))
-
-    centroids = alive_ticks.group_by(["round_num", "tick", "team"]).agg(
-        [
-            pl.col("x").mean().alias("team_cx"),
-            pl.col("y").mean().alias("team_cy"),
-        ]
-    )
-
-    pos = (
-        alive_ticks.join(centroids, on=["round_num", "tick", "team"], how="left")
-        .with_columns((((pl.col("x") - pl.col("team_cx")) ** 2 + (pl.col("y") - pl.col("team_cy")) ** 2).sqrt()).alias("dist_from_team_centroid"))
-    )
-
-    pos_by_player = pos.group_by([pl.col("player_name"), pl.col("team").alias("side")]).agg(
-        pl.col("dist_from_team_centroid").mean().alias("avg_distance_from_team")
-    )
-
-    global_dist_threshold = pos.select(pl.col("dist_from_team_centroid").quantile(0.75).alias("q75")).item()
-
-    isolation = (
-        pos.with_columns((pl.col("dist_from_team_centroid") > float(global_dist_threshold)).cast(pl.Int8).alias("isolated_flag"))
-        .group_by([pl.col("player_name"), pl.col("team").alias("side")])
-        .agg(pl.col("isolated_flag").mean().alias("isolation_rate"))
-    )
-
-    sampled_proximity_features, _sampled_ticks = build_sampled_proximity_features(alive_ticks)
-    engagement_proximity_features = build_engagement_proximity_features(alive_ticks, first_engagement_events)
-    position_entropy_features = build_position_entropy_features(alive_ticks)
-
-    df = players.join(rounds_per_player, on=["player_name", "side"], how="left")
-
-    for piece in [
-        kills_by_player,
-        deaths_by_player,
-        assists_by_player,
-        flash_assists_by_player,
-        opening_killers,
-        opening_victims,
-        dmg_by_player,
-        utility_damage_by_player,
-        engagement_times,
-        survival,
-        utility,
-        trade_kills,
-        traded_deaths,
-        trade_attempts,
-        pos_by_player,
-        isolation,
-        sampled_proximity_features,
-        engagement_proximity_features,
-        position_entropy_features,
-    ]:
-        join_keys = [k for k in ["player_name", "side"] if k in piece.columns and k in df.columns]
-        if join_keys:
-            df = df.join(piece, on=join_keys, how="left")
-        else:
-            df = df.join(piece, on=["player_name"], how="left")
-
-    df = df.fill_null(0)
-
-    df = df.with_columns(
-        [
-            pl.lit(map_name).alias("map_name"),
-
-            pl.when((pl.col("opening_kills") + pl.col("opening_deaths")) > 0)
-            .then(pl.col("opening_kills") / (pl.col("opening_kills") + pl.col("opening_deaths")))
-            .otherwise(0.0)
-            .alias("opening_success_rate"),
-
-            pl.when(pl.col("rounds_played") > 0)
-            .then(pl.col("survived_rounds") / pl.col("rounds_played"))
-            .otherwise(0.0)
-            .alias("survival_rate"),
-
-            pl.when(pl.col("rounds_played") > 0)
-            .then(pl.col("late_round_presence_rounds") / pl.col("rounds_played"))
-            .otherwise(0.0)
-            .alias("late_round_presence_rate"),
-
-            pl.when(pl.col("trade_attempts") > 0)
-            .then(pl.col("trade_kills") / pl.col("trade_attempts"))
-            .otherwise(0.0)
-            .alias("trade_success_rate"),
-
-            pl.when(pl.col("rounds_played") > 0)
-            .then((pl.col("trade_kills") + pl.col("traded_deaths")) / pl.col("rounds_played"))
-            .otherwise(0.0)
-            .alias("trade_participation_rate"),
-
-            pl.when(pl.col("kills") > 0)
-            .then(pl.col("headshot_kills") / pl.col("kills"))
-            .otherwise(0.0)
-            .alias("headshot_rate"),
-
-            pl.when(pl.col("kills") > 0)
-            .then(pl.col("awp_kills") / pl.col("kills"))
-            .otherwise(0.0)
-            .alias("awp_kill_share"),
-
-            pl.when(pl.col("kills") > 0)
-            .then(pl.col("rifle_kills") / pl.col("kills"))
-            .otherwise(0.0)
-            .alias("rifle_kill_share"),
-
-            pl.when(pl.col("kills") > 0)
-            .then(pl.col("pistol_kills") / pl.col("kills"))
-            .otherwise(0.0)
-            .alias("pistol_kill_share"),
-        ]
-    )
-
-    df = df.with_columns(
-        [
-            (pl.col("opening_kills") / pl.col("rounds_played")).fill_nan(0).alias("first_kill_rate"),
-            (pl.col("opening_deaths") / pl.col("rounds_played")).fill_nan(0).alias("first_death_rate"),
-            ((pl.col("opening_kills") + pl.col("opening_deaths")) / pl.col("rounds_played")).fill_nan(0).alias("entry_attempt_rate"),
-            pl.col("opening_success_rate").fill_nan(0).alias("entry_success_rate"),
-
-            (pl.col("opening_kills") / pl.col("rounds_played")).fill_nan(0).alias("opening_kills_per_round"),
-            ((pl.col("opening_kills") + pl.col("opening_deaths")) / pl.col("rounds_played")).fill_nan(0).alias("opening_attempts_per_round"),
-            ((pl.col("opening_kills") + pl.col("opening_deaths")) / pl.col("rounds_played")).fill_nan(0).alias("opening_duels_per_round"),
-
-            (pl.col("kills") / pl.col("rounds_played")).fill_nan(0).alias("kills_per_round"),
-            (pl.col("deaths") / pl.col("rounds_played")).fill_nan(0).alias("deaths_per_round"),
-            (pl.col("assists_raw") / pl.col("rounds_played")).fill_nan(0).alias("assists_per_round"),
-            (pl.col("flash_assists") / pl.col("rounds_played")).fill_nan(0).alias("flash_assists_per_round"),
-
-            (pl.col("early_round_kills") / pl.col("rounds_played")).fill_nan(0).alias("early_round_kill_rate"),
-            (pl.col("late_round_kills") / pl.col("rounds_played")).fill_nan(0).alias("late_round_kill_rate"),
-
-            (pl.col("hp_damage_total") / pl.col("rounds_played")).fill_nan(0).alias("hp_damage_per_round"),
-            (pl.col("armor_damage_total") / pl.col("rounds_played")).fill_nan(0).alias("armor_damage_per_round"),
-            (pl.col("utility_damage_total") / pl.col("rounds_played")).fill_nan(0).alias("utility_damage_per_round"),
-
-            pl.col("avg_time_to_first_engagement_ticks").fill_nan(0).alias("avg_time_to_first_engagement_ticks"),
-            pl.col("avg_time_to_first_engagement_seconds").fill_nan(0).alias("avg_time_to_first_engagement_seconds"),
-
-            pl.col("avg_survival_ticks").fill_nan(0).alias("avg_survival_ticks"),
-            pl.col("avg_survival_seconds").fill_nan(0).alias("avg_survival_seconds"),
-            pl.col("std_survival_ticks").fill_nan(0).alias("std_survival_ticks"),
-
-            (pl.col("trade_kills") / pl.col("kills")).fill_nan(0).alias("trade_kill_rate"),
-            (pl.col("trade_kills") / pl.col("rounds_played")).fill_nan(0).alias("trade_kills_per_round"),
-            (pl.col("traded_deaths") / pl.col("rounds_played")).fill_nan(0).alias("traded_deaths_per_round"),
-            (pl.col("trade_attempts") / pl.col("rounds_played")).fill_nan(0).alias("trade_attempts_per_round"),
-
+            pl.col("adr").fill_nan(0).alias("adr"),
+            pl.col("kast").fill_nan(0).alias("kast"),
+            pl.col("rating").fill_nan(0).alias("rating"),
             (pl.col("grenades_thrown") / pl.col("rounds_played")).fill_nan(0).alias("grenades_per_round"),
             (pl.col("flashbangs_thrown") / pl.col("rounds_played")).fill_nan(0).alias("flashbangs_per_round"),
             (pl.col("smokes_thrown") / pl.col("rounds_played")).fill_nan(0).alias("smokes_per_round"),
             (pl.col("fire_nades_thrown") / pl.col("rounds_played")).fill_nan(0).alias("fire_nades_per_round"),
-
-            pl.col("avg_distance_from_team").fill_nan(0).alias("avg_distance_from_team"),
-            pl.col("isolation_rate").fill_nan(0).alias("isolation_rate"),
-
-            pl.col("avg_nearby_teammates").fill_nan(0).alias("avg_nearby_teammates"),
-            pl.col("time_spent_alone_ratio").fill_nan(0).alias("time_spent_alone_ratio"),
-            pl.col("avg_nearby_teammates_at_engagement").fill_nan(0).alias("avg_nearby_teammates_at_engagement"),
-            pl.col("engagement_isolation_rate").fill_nan(0).alias("engagement_isolation_rate"),
-            pl.col("position_entropy").fill_nan(0).alias("position_entropy"),
+            (pl.col("hegrenades_thrown") / pl.col("rounds_played")).fill_nan(0).alias("hegrenades_per_round"),
+            (pl.col("decoys_thrown") / pl.col("rounds_played")).fill_nan(0).alias("decoys_per_round"),
+            pl.lit(map_name).alias("map_name"),
         ]
     )
 
-    feature_cols = [
-        "first_kill_rate",
-        "first_death_rate",
-        "entry_attempt_rate",
-        "entry_success_rate",
-        "early_round_kill_rate",
-        "late_round_kill_rate",
-        "late_round_presence_rate",
-
-        "opening_kills_per_round",
-        "opening_attempts_per_round",
-        "opening_duels_per_round",
-        "opening_success_rate",
-
-        "kills_per_round",
-        "deaths_per_round",
-        "assists_per_round",
-        "flash_assists_per_round",
-
-        "hp_damage_per_round",
-        "armor_damage_per_round",
-        "utility_damage_per_round",
-
-        "headshot_rate",
-        "awp_kill_share",
-        "rifle_kill_share",
-        "pistol_kill_share",
-
-        "avg_time_to_first_engagement_ticks",
-        "avg_time_to_first_engagement_seconds",
-        "avg_survival_ticks",
-        "avg_survival_seconds",
-        "std_survival_ticks",
-        "survival_rate",
-
-        "trade_kill_rate",
-        "trade_kills_per_round",
-        "traded_deaths_per_round",
-        "trade_attempts_per_round",
-        "trade_success_rate",
-        "trade_participation_rate",
-
+    base_cols = [
+        "player_name",
+        "map_name",
+        "side",
+        "rounds_played",
+        "adr",
+        "kast",
+        "rating",
+        "grenades_thrown",
+        "flashbangs_thrown",
+        "smokes_thrown",
+        "fire_nades_thrown",
+        "hegrenades_thrown",
+        "decoys_thrown",
         "grenades_per_round",
         "flashbangs_per_round",
         "smokes_per_round",
         "fire_nades_per_round",
-
-        "avg_distance_from_team",
-        "isolation_rate",
-        "avg_nearby_teammates",
-        "time_spent_alone_ratio",
-        "avg_nearby_teammates_at_engagement",
-        "engagement_isolation_rate",
-        "position_entropy",
+        "hegrenades_per_round",
+        "decoys_per_round",
+        "rifle_kills",
+        "awp_kills",
+        "smg_kills",
+        "pistol_kills",
+        "knife_kills",
+        "shotgun_kills",
+        "scout_kills",
+        "rifle_kills_per_round",
+        "awp_kills_per_round",
+        "smg_kills_per_round",
+        "pistol_kills_per_round",
+        "knife_kills_per_round",
+        "shotgun_kills_per_round",
+        "scout_kills_per_round",
+        "utility_kills",
+        "he_kills",
+        "fire_kills",
+        "utility_kills_per_round",
+        "he_kills_per_round",
+        "fire_kills_per_round",
+        "trade_kills",
+        "traded_deaths",
+        "trade_kills_per_round",
+        "traded_deaths_per_round",
+        "death_traded_rate",
+        "trade_participation",
+        "trade_participation_per_round",
+        "opening_kills",
+        "opening_deaths",
+        "opening_duels",
+        "opening_kills_per_round",
+        "opening_deaths_per_round",
+        "opening_duels_per_round",
+        "opening_duel_success_rate",
     ]
 
-    df = df.select(["player_name", "map_name", "side", "rounds_played", *feature_cols])
+    existing_cols = [c for c in base_cols if c in df.columns]
+    df = df.select(existing_cols)
 
     pivot = df.pivot(
-        values=["rounds_played", *feature_cols],
+        values=[c for c in df.columns if c not in {"player_name", "map_name", "side"}],
         index=["player_name", "map_name"],
         on="side",
         aggregate_function="first",
@@ -978,7 +829,9 @@ def resolve_input_path(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Extract side-split CS2 features from demos.")
+    parser = argparse.ArgumentParser(
+        description="Extract ADR, KAST, Rating, utility usage, utility kills, and condensed weapon-category kills from CS2 demos."
+    )
     parser.add_argument(
         "input_path",
         nargs="?",
@@ -1029,6 +882,8 @@ def main() -> None:
         raise RuntimeError("No demos parsed successfully.")
 
     out = pl.concat(rows, how="diagonal_relaxed")
+    out = out.fill_null(0).fill_nan(0)
+
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if args.output_path.suffix.lower() == ".csv":
