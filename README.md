@@ -13,7 +13,7 @@ The goal is not to force players into the traditional rigid labels, but to test 
 ## Methods
 
 The pipeline consists of three main stages:
-1. CS2 demos are parsed using awpy to extract round-level and event-level data
+1. CS2 demos are parsed using `awpy` to extract round-level and event-level data
 2. Data is aggregated across multiple demos by player
 3. A PCA is applied and 3 clustering algorithms(K-Means, GMM, HDBSCAN) are applied to try and group the players
 
@@ -79,8 +79,8 @@ All features are computed separately by side, then aggregated and pivoted into s
 
 | Feature             | Description                          |
 | ------------------- | ------------------------------------ |
-| `awp_kill_share`    | Fraction of kills made with the AWP. |
-| `rifle_kill_share`  | Fraction of kills made with rifles.  |
+| **awp_kill_share**    | Fraction of kills made with the AWP. |
+| **rifle_kill_share**  | Fraction of kills made with rifles.  |
 
 ### Utility
 
