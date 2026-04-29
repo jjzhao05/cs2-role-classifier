@@ -11,15 +11,75 @@ SUMMARIES_DIR = INPUT_DIR / "summaries"
 PLOTS_DIR = Path("plots")
 
 RADAR_FEATURES = [
-    "opening_attempts_per_round_T",
-    "opening_success_rate_T",
-    "trade_success_rate_T",
-    "flash_assists_per_round_T",
-    "awp_kill_share_T",
-    "rifle_kill_share_T",
-    "avg_distance_from_team_T",
-    "isolation_rate_T",
+    "opening_kill_rate_t",
+    "opening_duel_success_t",
+    "trade_kill_rate_t",
+    "death_traded_rate_t",
+    "flash_assists_per_round_t",
+    "util_damage_per_round_t",
+    "awp_kill_share_t",
+    "rifle_kill_share_t",
+    "multi_kill_rate_t",
+    "grenades_per_round_t",
 ]
+
+
+def get_top_methods(results_path: Path, top_n: int = 3) -> list[str]:
+    if not results_path.exists():
+        print(f"[skip] missing {results_path}")
+        return []
+
+    df = pd.read_csv(results_path)
+    if df.empty:
+        print("[skip] clustering results file is empty")
+        return []
+
+    top_methods = []
+    for method_name in sorted(df["method"].dropna().unique()):
+        sub = df[df["method"] == method_name].copy()
+        sub = sub.sort_values(
+            by=["silhouette", "davies_bouldin"],
+            ascending=[False, True],
+            na_position="last",
+        ).head(top_n)
+
+        names = sub["output_name"].dropna().tolist()
+        top_methods.extend(names)
+
+        print(f"\nTop {top_n} for {method_name}:")
+        cols = ["output_name", "k", "silhouette", "davies_bouldin", "cluster_sizes"]
+        print(sub[cols].to_string(index=False))
+
+    return top_methods
+
+
+def get_combined_side_metric(df: pd.DataFrame, base_name: str) -> tuple[pd.Series | None, str | None]:
+    if base_name in df.columns:
+        s = pd.to_numeric(df[base_name], errors="coerce")
+        return s, base_name
+
+    t_col = f"{base_name}_t"
+    ct_col = f"{base_name}_ct"
+
+    has_t = t_col in df.columns
+    has_ct = ct_col in df.columns
+
+    if has_t and has_ct:
+        s = (
+            pd.to_numeric(df[t_col], errors="coerce").fillna(0) +
+            pd.to_numeric(df[ct_col], errors="coerce").fillna(0)
+        ) / 2.0
+        return s, f"{base_name}_avg"
+
+    if has_t:
+        s = pd.to_numeric(df[t_col], errors="coerce")
+        return s, t_col
+
+    if has_ct:
+        s = pd.to_numeric(df[ct_col], errors="coerce")
+        return s, ct_col
+
+    return None, None
 
 
 def plot_pca_scatter(players: pd.DataFrame, method_name: str, output_dir: Path) -> None:
@@ -69,6 +129,61 @@ def plot_pca_scatter(players: pd.DataFrame, method_name: str, output_dir: Path) 
     plt.close()
 
 
+def plot_rating_box(players: pd.DataFrame, method_name: str, output_dir: Path) -> None:
+    if players.empty:
+        print(f"[skip] {method_name} rating box players file is empty")
+        return
+
+    if "cluster" not in players.columns:
+        print(f"[skip] {method_name} missing cluster column")
+        return
+
+    rating_vals, rating_label = get_combined_side_metric(players, "rating")
+    if rating_vals is None:
+        print(f"[skip] {method_name} no rating column found")
+        return
+
+    plot_df = pd.DataFrame(
+        {
+            "cluster": players["cluster"],
+            "rating": rating_vals,
+        }
+    ).dropna()
+
+    if plot_df.empty:
+        print(f"[skip] {method_name} no usable rating data")
+        return
+
+    non_noise = plot_df.loc[plot_df["cluster"] != -1].copy()
+    noise = plot_df.loc[plot_df["cluster"] == -1].copy()
+
+    cluster_order = sorted(non_noise["cluster"].unique()) if not non_noise.empty else []
+    labels = [str(c) for c in cluster_order]
+    data = [non_noise.loc[non_noise["cluster"] == c, "rating"].tolist() for c in cluster_order]
+
+    if not noise.empty:
+        labels.append("noise")
+        data.append(noise["rating"].tolist())
+
+    if not data:
+        print(f"[skip] {method_name} no cluster data for rating box")
+        return
+
+    plt.figure(figsize=(10, 6))
+    box = plt.boxplot(data, tick_labels=labels, patch_artist=True)
+
+    for patch in box["boxes"]:
+        patch.set_alpha(0.5)
+
+    plt.xlabel("Cluster")
+    plt.ylabel(rating_label)
+    plt.title(f"Rating Distribution by Cluster: {method_name}")
+    plt.grid(True, axis="y")
+    plt.tight_layout()
+    plt.savefig(output_dir / f"{method_name}_rating_box.png", dpi=200)
+    plt.close()
+
+
 def make_radar(ax, values, categories, title):
     n = len(categories)
     angles = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
@@ -100,6 +215,8 @@ def plot_radar(summary: pd.DataFrame, method_name: str, output_dir: Path) -> Non
         return
 
     radar_df = summary.copy()
+    for c in radar_features:
+        radar_df[c] = pd.to_numeric(radar_df[c], errors="coerce")
 
     mins = radar_df[radar_features].min()
     maxs = radar_df[radar_features].max()
@@ -125,7 +242,9 @@ def plot_radar(summary: pd.DataFrame, method_name: str, output_dir: Path) -> Non
 
     axes = np.array(axes).reshape(-1)
 
+    last_i = -1
     for i, (_, row) in enumerate(radar_scaled.iterrows()):
+        last_i = i
         make_radar(
             axes[i],
             row[radar_features],
@@ -133,7 +252,7 @@ def plot_radar(summary: pd.DataFrame, method_name: str, output_dir: Path) -> Non
             f"{method_name} cluster {int(row['cluster'])}",
         )
 
-    for j in range(i + 1, len(axes)):
+    for j in range(last_i + 1, len(axes)):
         fig.delaxes(axes[j])
 
     plt.tight_layout()
@@ -147,21 +266,17 @@ def plot_k_metrics(results_path: Path, output_dir: Path) -> None:
         return
 
     df = pd.read_csv(results_path)
-
     if df.empty:
         print("[skip] clustering results file is empty")
         return
 
-    # Plot k-based methods
     k_df = df[df["k"].notna()].copy()
     if not k_df.empty:
         k_df["k"] = k_df["k"].astype(int)
 
     methods = sorted(k_df["method"].dropna().unique()) if not k_df.empty else []
-
     sil_df = k_df.dropna(subset=["silhouette"]).copy() if not k_df.empty else pd.DataFrame()
 
-    # HDBSCAN reference line
     hdbscan_df = df[
         (df["method"] == "hdbscan") &
         (df["silhouette"].notna())
@@ -203,21 +318,25 @@ def plot_k_metrics(results_path: Path, output_dir: Path) -> None:
 def main():
     PLOTS_DIR.mkdir(exist_ok=True)
 
-    if not ASSIGNMENTS_DIR.exists():
-        print(f"[skip] missing assignments directory: {ASSIGNMENTS_DIR}")
+    results_path = INPUT_DIR / "clustering_method_comparison.csv"
+    top_method_names = get_top_methods(results_path, top_n=3)
+
+    if not top_method_names:
+        print("[skip] no top methods found")
         return
 
-    player_files = sorted(ASSIGNMENTS_DIR.glob("*_players.csv"))
-    if not player_files:
-        print(f"[skip] no player assignment files found in {ASSIGNMENTS_DIR}")
-        return
-
-    for players_path in player_files:
-        method_name = players_path.stem.replace("_players", "")
+    for method_name in top_method_names:
+        players_path = ASSIGNMENTS_DIR / f"{method_name}_players.csv"
         summary_path = SUMMARIES_DIR / f"{method_name}_summary.csv"
 
+        if not players_path.exists():
+            print(f"[skip] missing {players_path}")
+            continue
+
         players = pd.read_csv(players_path)
+
         plot_pca_scatter(players, method_name, PLOTS_DIR)
+        plot_rating_box(players, method_name, PLOTS_DIR)
 
         if summary_path.exists():
             summary = pd.read_csv(summary_path)
@@ -225,10 +344,7 @@ def main():
         else:
             print(f"[skip] missing {summary_path}")
 
-    plot_k_metrics(
-        INPUT_DIR / "clustering_method_comparison.csv",
-        PLOTS_DIR,
-    )
+    plot_k_metrics(results_path, PLOTS_DIR)
 
     print(f"\nSaved plots in ./{PLOTS_DIR}")
 

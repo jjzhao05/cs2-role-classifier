@@ -109,6 +109,6 @@ The dataset consists of professional CS2 match demos collected from HLTV.org and
 
 ### Notes
 
-- The dataset consists of all matches played during IEM Rio 2026, PGL Bucharest 2026, and BLAST Open Rotterdam 2026.
+- The dataset consists of all matches played during IEM Rio 2026.
 - All features are computed directly from parsed demo data.
 - Player statistics are aggregated across multiple matches to reduce variance.
