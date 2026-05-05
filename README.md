@@ -77,6 +77,7 @@ Data is stored in long format, where each row represents a player–side observa
 | **first_contact_rate**   | Fraction of rounds with first engagement `[0–1]` |
 
 ### Trading
+**Trading** refers to a kill that occurs shortly after a teammate’s death, where the killer eliminates the opponent responsible for that death within 5 seconds.
 
 | Feature                 | Description                                    |
 | ----------------------- | ---------------------------------------------- |
@@ -114,8 +115,6 @@ Data is stored in long format, where each row represents a player–side observa
 The dataset consists of professional CS2 match demos collected from HLTV.org and parsed using `awpy`.
 
 ### Notes
-
-* **Trading** refers to a kill that occurs shortly after a teammate’s death, where the killer eliminates the opponent responsible for that death within 5 seconds.
 
 - The dataset consists of all matches played during IEM Rio 2026.
 - All features are computed directly from parsed demo data.
