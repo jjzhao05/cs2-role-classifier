@@ -36,7 +36,7 @@ python demo_parser.py --use-main-demos outputs/full_output.csv
 
 ## Schema
 
-All features are computed separately by side, then aggregated and pivoted into side-specific columns. Most features are normalized by rounds played so players can be compared across demos with different lengths.
+Data is stored in long format, where each row represents a player–side observation. All features are computed per player per side. Most features are normalized by rounds played, enabling comparison across demos of different lengths. 
 
 ### Identifiers
 
@@ -80,7 +80,7 @@ All features are computed separately by side, then aggregated and pivoted into s
 
 | Feature                 | Description                                    |
 | ----------------------- | ---------------------------------------------- |
-| **trade_kill_rate**     | Fraction of kills that are trades `[0–1]`      |
+| **trade_kill_rate**     | Fraction of kills that are trades* `[0–1]`      |
 | **death_traded_rate**   | Fraction of deaths traded by teammates `[0–1]` |
 | **trade_participation** | Fraction of trade involvement `[0–1]`          |
 
@@ -114,6 +114,8 @@ All features are computed separately by side, then aggregated and pivoted into s
 The dataset consists of professional CS2 match demos collected from HLTV.org and parsed using `awpy`.
 
 ### Notes
+
+* **Trading** refers to a kill that occurs shortly after a teammate’s death, where the killer eliminates the opponent responsible for that death within 5 seconds.
 
 - The dataset consists of all matches played during IEM Rio 2026.
 - All features are computed directly from parsed demo data.
