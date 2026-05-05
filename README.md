@@ -8,14 +8,14 @@ Although all players share the same core mechanics, at the highest level of play
 
 ## Goal
 
-The goal is not to force players into the traditional rigid labels, but to test whether recognizable professional roles emerge naturally from behavioral gameplay data.
+The goal is not to force players into the traditional rigid labels, but to test whether recognizable roles emerge from gameplay data.
 
 ## Methods
 
 The pipeline consists of three main stages:
 1. CS2 demos are parsed using `awpy` to extract round-level and event-level data
 2. Data is aggregated across multiple demos by player
-3. A PCA is applied and 3 clustering algorithms(K-Means, GMM, HDBSCAN) are applied to try and group the players
+3. A PCA is applied and 2 clustering algorithms(K-Means, GMM) are applied to try and group the players
 
 
 ## Results(WIP)
@@ -34,78 +34,84 @@ python demo_parser.py --test outputs/test_output.csv
 
 python demo_parser.py --use-main-demos outputs/full_output.csv
 
-## Feature Definitions
+## Schema
 
 All features are computed separately by side, then aggregated and pivoted into side-specific columns. Most features are normalized by rounds played so players can be compared across demos with different lengths.
 
+### Identifiers
+
+| Feature         | Description                     |
+| --------------- | ------------------------------- |
+| **player_name** | Player identifier (categorical) |
+| **side**        | Team side (categorical: T / CT) |
+
 ### Generic 
 
-| Feature             | Description                            |
-| ------------------- | -------------------------------------- |
-| **kpr**             | Kills per round                        |
-| **dpr**             | Deaths per round                       |
-| **kdr**             | Kill-to-death ratio                    |
-| **survival_rate**   | Fraction of rounds the player survives |
-| **multi_kill_rate** | Frequency of rounds with 2+ kills      |
+| Feature           | Description                       |
+| ----------------- | --------------------------------- |
+| **adr**           | Mean damage per round             |
+| **kpr**           | Mean kills per round              |
+| **survival_rate** | Fraction of rounds survived [0–1] |
 
-### Damage
 
-| Feature                    | Description                              |
-| -------------------------- | ---------------------------------------- |
-| **damage_per_round**       | Average damage dealt per round           |
-| **damage_taken_per_round** | Average damage taken per round           |
-| **damage_diff_per_round**  | Net damage advantage per round           |
-| **adr**                    | Average damage per round                 |
-| **util_damage_per_round**  | Utility damage per round                 |
+### Combat output
+
+| Feature                    | Description                                    |
+| -------------------------- | ---------------------------------------------- |
+| **damage_per_round**       | Mean damage dealt per round                    |
+| **damage_taken_per_round** | Mean damage received per round                 |
+| **damage_diff_per_round**  | Mean net damage per round                      |
+| **assists_per_round**      | Mean assists per round                         |
+| **multi_kill_rate**        | Fraction of rounds with multiple kills `[0–1]` |
+| **rifle_kill_share**       | Fraction of kills with rifles `[0–1]`          |
+| **awp_kill_share**         | Fraction of kills with AWP `[0–1]`             |
+
 
 ### Opening
 
-| Feature                   | Description                                    |
-| ------------------------- | ---------------------------------------------- |
-| **opening_kill_rate** | Fraction of kills that are opening kills |
-| **opening_death_rate** | Fraction of deaths that are opening deaths |
-| **opening_duel_attempts** | Number of opening duels taken per round |
-| **opening_duel_success**  | How often the player wins opening fights       |
+| Feature                  | Description                                      |
+| ------------------------ | ------------------------------------------------ |
+| **opening_kill_rate**    | Fraction of rounds with opening kill `[0–1]`     |
+| **opening_death_rate**   | Fraction of rounds with opening death `[0–1]`    |
+| **opening_duel_success** | Opening duel win rate `[0–1]`                    |
+| **first_contact_rate**   | Fraction of rounds with first engagement `[0–1]` |
 
 ### Trading
 
-| Feature                 | Description                                           |
-| ----------------------- | ----------------------------------------------------- |
-| **trade_kill_rate**     | How often the player’s kills are trades               |
-| **death_traded_rate**   | How often the player’s deaths are traded by teammates |
-| **trade_participation** | Trades participated in per round                      |
-
-### Weapon Usage
-
-| Feature             | Description                          |
-| ------------------- | ------------------------------------ |
-| **awp_kill_share**    | Fraction of kills made with the AWP. |
-| **rifle_kill_share**  | Fraction of kills made with rifles.  |
+| Feature                 | Description                                    |
+| ----------------------- | ---------------------------------------------- |
+| **trade_kill_rate**     | Fraction of kills that are trades `[0–1]`      |
+| **death_traded_rate**   | Fraction of deaths traded by teammates `[0–1]` |
+| **trade_participation** | Fraction of trade involvement `[0–1]`          |
 
 ### Utility
 
-| Feature                   | Description                     |
-| ------------------------- | ------------------------------- |
-| **he_grenades_per_round** | HE grenades thrown per round |
-| **flashbangs_per_round**  | Flashbangs thrown per round |
-| **smokes_per_round**      | Smokes thrown per round |
-| **fire_nades_per_round**  | Molotovs and incendiaries thrown per round |
-| **decoys_per_round**      | Decoys thrown per round |
+| Feature                     | Description                                     |
+| --------------------------- | ----------------------------------------------- |
+| **grenades_per_round**      | Mean grenades used per round                    |
+| **he_grenades_per_round**   | Mean HE grenades used per round                 |
+| **flashbangs_per_round**    | Mean flashbangs used per round                  |
+| **smokes_per_round**        | Mean smokes used per round                      |
+| **fire_nades_per_round**    | Mean molotov/incendiary grenades used per round |
+| **decoys_per_round**        | Mean decoys used per round                      |
+| **flash_assists_per_round** | Mean flash assists per round                    |
+| **util_damage_per_round**   | Mean damage dealt via utility                   |
 
-### Other
+### Movement and Positioning
 
-| Feature    | Description                                                |
-| ---------- | ---------------------------------------------------------- |
-| **kast**   | Percentage of rounds with kill, assist, survival, or trade |
-| **impact** | Overall round impact score                                 |
-| **rating** | Overall performance rating                                 |
-
+| Feature                              | Description                            |
+| ------------------------------------ | -------------------------------------- |
+| **avg_distance_to_enemy**            | Mean distance to nearest enemy         |
+| **avg_distance_to_team_centroid**    | Mean distance to team centroid         |
+| **relative_team_centroid_distance**  | Normalized distance from team centroid |
+| **avg_distance_moved_per_round**     | Mean distance traveled per round       |
+| **avg_distance_to_closest_teammate** | Mean distance to nearest teammate      |
+| **time_near_enemy_rate**             | Fraction of time near enemies `[0–1]`  |
+| **time_stationary_rate**             | Fraction of time stationary `[0–1]`    |
 
 ## Dataset
 
 The dataset consists of professional CS2 match demos collected from HLTV.org and parsed using `awpy`.
-
-### Summary Statistics
 
 ### Notes
 

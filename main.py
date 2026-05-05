@@ -7,7 +7,7 @@ PYTHON = r"C:\Users\Jonathan Zhao\AppData\Local\Microsoft\WindowsApps\python3.11
 
 UNZIP_SCRIPT = Path("file_unzipper.py")
 PARSER_SCRIPT = Path("demo_parser.py")
-CLUSTER_SCRIPT = Path("compare_clustering_methods.py")
+CLUSTER_SCRIPT = Path("cluster_players.py")
 PLOT_SCRIPT = Path("plotter.py")
 
 DEMOS_DIR = Path(r"C:\Users\Jonathan Zhao\Documents\GitHub\cs2-role-classifier\demos")
