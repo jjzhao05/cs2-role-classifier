@@ -118,4 +118,4 @@ The dataset consists of professional CS2 match demos collected from HLTV.org and
 
 - The dataset consists of all matches played during IEM Rio 2026.
 - All features are computed directly from parsed demo data.
-- Player statistics are aggregated across multiple matches to reduce variance.
+- I plan on using data from IEM Cologne Major, IEM Atlanta, and PGL Astana, as that represents a period with limited roster and positional changes due to roster locks
