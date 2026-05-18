@@ -1,7 +1,5 @@
 # CS2 Role Classifier
 
-An unsupervised pipeline for inferring player roles from professional Counter-Strike 2 match demos. Behavioral features are extracted from raw demo files and clustered to discover whether recognizable roles emerge from gameplay data alone — without any manual labeling.
-
 ## Background
 
 Counter-Strike 2 is a competitive, team-based first-person shooter where two teams of five — Terrorists (T) and Counter-Terrorists (CT) — compete in round-based matches. The T side aims to plant a bomb at a designated site and defend it until detonation; the CT side aims to prevent the plant or defuse the bomb. At the highest level, the game involves tactical positioning, utility usage (grenades, flashbangs, smokes, molotovs), economic decision-making, and mechanical skill.
@@ -23,10 +21,10 @@ demos/
  file_unzipper.py     Extract .rar archives from Downloads, deduplicate .dem files
        │
        ▼
- demo_parser.py       Parse demos → per-player, per-side feature CSV (long format)
+ demo_parser.py       Parse demos → per-player, per-side feature CSV
        │
        ▼
- cluster_players.py   Run KMeans, GMM, HDBSCAN · score · write assignments + summaries
+ cluster_players.py   Run KMeans, GMM, HDBSCAN
        │
        ▼
  plotter.py           PCA scatter plots, radar charts, silhouette vs k chart
@@ -45,45 +43,6 @@ python cluster_players.py
 python plotter.py
 ```
 
-## Usage
-
-### Parsing
-
-```bash
-# Parse a folder of demos
-python demo_parser.py demos/ output.csv
-
-# Parse a single demo
-python demo_parser.py demos/match.dem output.csv
-```
-
-### Clustering
-
-Configure at the top of `cluster_players.py`:
-
-```python
-MIN_ROUNDS_PLAYED = 26          # minimum rounds to include a player
-K_VALUES = [2, 3, 4, 5, 6, 7, 8]
-SILHOUETTE_SAMPLE = 300         # set None for exact (slow on large datasets)
-HDBSCAN_MIN_CLUSTER_SIZES = [3, 5, 10, 15]
-HDBSCAN_MIN_SAMPLES = [1, 3, 5]
-```
-
-## Output Structure
-
-```
-outputs/
-  clustering_method_comparison.csv   All models ranked by silhouette + Davies-Bouldin
-  assignments/
-    {side}_{method}_players.csv      Per-player cluster assignments + PCA coordinates
-  summaries/
-    {side}_{method}_summary.csv      Per-cluster feature means
-plots/
-  {method}_pca.png                   PCA scatter with cluster labels
-  {method}_radar.png                 Radar chart per cluster
-  silhouette_vs_k.png                Silhouette score vs k across all methods
-```
-
 ## Methods
 
 Three clustering algorithms are evaluated per side (CT and T separately):
@@ -94,7 +53,7 @@ Three clustering algorithms are evaluated per side (CT and T separately):
 | **GMM** | k ∈ [2, 8], full covariance |
 | **HDBSCAN** | grid search over min_cluster_size × min_samples; noise points excluded from scoring |
 
-Models are ranked by silhouette score (higher = better) then Davies-Bouldin index (lower = better). The top 3 models per method per side are plotted.
+Models are ranked by silhouette score then Davies-Bouldin index. The top 3 models per method per side are plotted.
 
 Feature importance is printed after clustering using a `RandomForestClassifier` trained to predict cluster labels — this identifies which features drove the separation.
 
@@ -173,7 +132,7 @@ A trade kill is defined as a kill that occurs within 5 seconds of a teammate's d
 
 ### Consistency (std columns)
 
-For players with multiple demos, a `{feature}_std` column is computed alongside each rate feature, capturing game-to-game variance. A player with high `awp_kill_share` but high `awp_kill_share_std` is a situational AWPer; low std indicates a dedicated role.
+For players with multiple demos, a `{feature}_std` column is computed alongside each rate feature, capturing game-to-game variance. A player with high `awp_kill_share` but high `awp_kill_share_std` may be a situational or secondary AWPer; low std may indicate a dedicated role.
 
 Std columns are only non-zero when more than one demo is parsed.
 
@@ -191,7 +150,7 @@ Some roles recover cleanly from this data:
 
 Professional CS2 match demos from HLTV.org, parsed using [`awpy`](https://github.com/pnxenopoulos/awpy).
 
-Currently using demos from **IEM Rio 2026**. Planned expansion to IEM Cologne Major, IEM Atlanta, and PGL Astana — a period with limited roster changes due to transfer locks, which improves cross-demo player consistency.
+Currently using demos from **IEM Rio 2026**. Planned expansion to IEM Cologne Major 2026, IEM Atlanta 2026,  PGL Astana 2026, and CS Asia Championship 2026, a period with limited roster changes due to transfer locks.
 
 ## Dependencies
 
