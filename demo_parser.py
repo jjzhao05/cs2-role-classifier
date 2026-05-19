@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -12,6 +14,11 @@ from awpy.stats import adr, calculate_trades, kast, rating
 
 NEAR_ENEMY_RADIUS = 750.0
 STATIONARY_STEP_DISTANCE = 1.0
+
+# Number of worker processes for parallel demo parsing.
+# Defaults to all logical CPU cores; lower this if memory is tight
+# (each worker loads a full demo into memory simultaneously).
+WORKERS = os.cpu_count() or 1
     
 TEAM_ALIASES = {
     "t": "t",
@@ -73,7 +80,6 @@ RATE_COLUMNS_TO_DROP = {
 }
 
 FINAL_COLUMNS_TO_DROP = {
-    "rounds_played",
     "kast",
     "impact",
     "rating",
@@ -927,6 +933,10 @@ def combine_demo_results(frames: Iterable[pl.DataFrame]) -> pl.DataFrame:
     if not frames:
         raise RuntimeError("No demos parsed successfully.")
 
+    # Compute rates on each per-demo frame first so std is taken over
+    # per-demo rates (e.g. kpr per demo), not raw counts.
+    frames = [add_rates(f) for f in frames]
+
     df = pl.concat(frames, how="diagonal_relaxed")
     work = df
 
@@ -945,11 +955,20 @@ def combine_demo_results(frames: Iterable[pl.DataFrame]) -> pl.DataFrame:
         and not c.startswith("_")
     ]
 
+    # Columns to compute std over: weighted/rate cols (most informative for
+    # consistency) and position features. Excludes raw counts and rounds_played.
+    std_cols = [c for c in weighted_cols if c in work.columns]
+
     agg_exprs = [pl.sum(c).alias(c) for c in sum_cols]
     agg_exprs.extend(
         pl.sum(f"_{c}_weighted").alias(f"_{c}_weighted")
         for c in weighted_cols
         if f"_{c}_weighted" in work.columns
+    )
+    # Std aggregations — _std suffix marks them clearly as variance features.
+    agg_exprs.extend(
+        pl.std(c).fill_null(0.0).alias(f"{c}_std")
+        for c in std_cols
     )
 
     combined = work.group_by(SIDE_KEYS).agg(agg_exprs)
@@ -966,22 +985,6 @@ def combine_demo_results(frames: Iterable[pl.DataFrame]) -> pl.DataFrame:
 
     combined = combined.drop([c for c in combined.columns if c.startswith("_")])
     return keep_rate_features_only(add_rates(combined))
-
-
-def split_sides_wide(df: pl.DataFrame) -> pl.DataFrame:
-    value_cols = [c for c in df.columns if c not in SIDE_KEYS]
-    wide = df.pivot(index="player_name", on="side", values=value_cols, aggregate_function="first")
-
-    rename_map = {}
-    for col in wide.columns:
-        if col == "player_name" or col.endswith(("_ct", "_t")):
-            continue
-        if col.startswith("ct_"):
-            rename_map[col] = f"{col[3:]}_ct"
-        elif col.startswith("t_"):
-            rename_map[col] = f"{col[2:]}_t"
-
-    return wide.rename(rename_map).fill_null(0).fill_nan(0)
 
 
 def sort_output_columns(df: pl.DataFrame) -> pl.DataFrame:
@@ -1020,8 +1023,17 @@ def sort_output_columns(df: pl.DataFrame) -> pl.DataFrame:
         "time_stationary_rate",
     ]
 
-    preferred = ["player_name", "side"] + metric_order
-    existing = [c for c in preferred if c in df.columns]
+    # Interleave _std columns right after their base column so the CSV reads
+    # naturally: adr, adr_std, kpr, kpr_std, ...
+    ordered: list[str] = ["player_name", "side", "rounds_played"]
+    for col in metric_order:
+        if col in df.columns:
+            ordered.append(col)
+        std_col = f"{col}_std"
+        if std_col in df.columns:
+            ordered.append(std_col)
+
+    existing = [c for c in ordered if c in df.columns]
     remaining = [c for c in df.columns if c not in existing]
     return df.select(existing + remaining).sort(["player_name", "side"])
 
@@ -1047,15 +1059,28 @@ def main() -> None:
 
     frames: list[pl.DataFrame] = []
     success_count = 0
+    total = len(demo_files)
 
-    for i, demo_path in enumerate(demo_files, start=1):
-        print(f"[{i}/{len(demo_files)}] parsing: {demo_path}")
-        try:
-            frames.append(parse_single_demo(demo_path))
-            success_count += 1
-            print(f"[ok {i}/{len(demo_files)}] parsed successfully")
-        except Exception as exc:
-            print(f"[skip {i}/{len(demo_files)}] {demo_path}: {exc}")
+    print(f"[info] spawning {WORKERS} worker process(es)")
+
+    # Each demo is parsed in its own process — fully independent, no shared
+    # state — so ProcessPoolExecutor sidesteps the GIL and gets real
+    # parallelism for the CPU/IO-bound awpy parsing work.
+    with ProcessPoolExecutor(max_workers=WORKERS) as pool:
+        future_to_path = {
+            pool.submit(parse_single_demo, demo_path): demo_path
+            for demo_path in demo_files
+        }
+
+        for future in as_completed(future_to_path):
+            demo_path = future_to_path[future]
+            print(f"[{success_count + 1}/{total}] finished: {demo_path.name}")
+            try:
+                frames.append(future.result())
+                success_count += 1
+                print(f"[ok] {demo_path.name}")
+            except Exception as exc:
+                print(f"[skip] {demo_path.name}: {exc}")
 
     if not frames:
         raise RuntimeError("No demos parsed successfully.")

@@ -11,16 +11,16 @@ SUMMARIES_DIR = INPUT_DIR / "summaries"
 PLOTS_DIR = Path("plots")
 
 RADAR_FEATURES = [
-    "opening_kill_rate_t",
-    "opening_duel_success_t",
-    "trade_kill_rate_t",
-    "death_traded_rate_t",
-    "flash_assists_per_round_t",
-    "util_damage_per_round_t",
-    "awp_kill_share_t",
-    "rifle_kill_share_t",
-    "multi_kill_rate_t",
-    "grenades_per_round_t",
+    "opening_kill_rate",
+    "opening_duel_success",
+    "trade_kill_rate",
+    "death_traded_rate",
+    "flash_assists_per_round",
+    "util_damage_per_round",
+    "awp_kill_share",
+    "rifle_kill_share",
+    "multi_kill_rate",
+    "grenades_per_round",
 ]
 
 
@@ -35,8 +35,14 @@ def get_top_methods(results_path: Path, top_n: int = 3) -> list[str]:
         return []
 
     top_methods = []
-    for method_name in sorted(df["method"].dropna().unique()):
-        sub = df[df["method"] == method_name].copy()
+    # Group by side AND method so each side gets equal representation.
+    groups = (
+        df[["side", "method"]].dropna().drop_duplicates()
+        .sort_values(["side", "method"])
+        .itertuples(index=False)
+    )
+    for side, method_name in groups:
+        sub = df[(df["side"] == side) & (df["method"] == method_name)].copy()
         sub = sub.sort_values(
             by=["silhouette", "davies_bouldin"],
             ascending=[False, True],
@@ -46,7 +52,7 @@ def get_top_methods(results_path: Path, top_n: int = 3) -> list[str]:
         names = sub["output_name"].dropna().tolist()
         top_methods.extend(names)
 
-        print(f"\nTop {top_n} for {method_name}:")
+        print(f"\nTop {top_n} for {side.upper()} {method_name}:")
         cols = ["output_name", "k", "silhouette", "davies_bouldin", "cluster_sizes"]
         print(sub[cols].to_string(index=False))
 
@@ -336,7 +342,6 @@ def main():
         players = pd.read_csv(players_path)
 
         plot_pca_scatter(players, method_name, PLOTS_DIR)
-        plot_rating_box(players, method_name, PLOTS_DIR)
 
         if summary_path.exists():
             summary = pd.read_csv(summary_path)
