@@ -2,12 +2,12 @@
 
 ## Background
 
-Counter-Strike 2 is a competitive, team-based first-person shooter where two teams of five — Terrorists (T) and Counter-Terrorists (CT) — compete in round-based matches. The T side aims to plant a bomb at a designated site and defend it until detonation; the CT side aims to prevent the plant or defuse the bomb. At the highest level, the game involves tactical positioning, utility usage (grenades, flashbangs, smokes, molotovs), economic decision-making, and mechanical skill.
+Counter-Strike 2 is a competitive, team-based first-person shooter where two teams of five, Terrorists (T) and Counter-Terrorists (CT), compete in round-based matches. The T side aims to plant a bomb at a designated site and defend it until detonation; the CT side aims to prevent the plant or defuse the bomb. At the highest level, the game involves tactical positioning, utility usage (grenades, flashbangs, smokes, molotovs), economic decision-making, and mechanical skill.
 
 Although all players share the same mechanics, professional teams develop distinct roles. Some are easily defined:
 
-- **AWPer** — uses the AWP sniper rifle to hold angles, punish peeks, and control space
-- **IGL** (In-Game Leader) — makes tactical calls and directs the team mid-round
+- **AWPer**: uses the AWP sniper rifle to hold angles, punish peeks, and control space
+- **IGL** (In-Game Leader): makes tactical calls and directs the team mid-round
 
 Others are far less well-defined: entry fraggers, lurkers, anchors, support riflers. The goal of this project is not to force players into rigid labels, but to test whether these archetypes emerge naturally from the data.
 
