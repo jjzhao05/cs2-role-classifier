@@ -55,7 +55,7 @@ Three clustering algorithms are evaluated per side (CT and T separately):
 
 Models are ranked by silhouette score then Davies-Bouldin index. The top 3 models per method per side are plotted.
 
-Feature importance is printed after clustering using a `RandomForestClassifier` trained to predict cluster labels — this identifies which features drove the separation.
+Feature importance is printed after clustering using a `RandomForestClassifier` trained to predict cluster labels.
 
 PCA is computed once per side and reused across all models for consistent 2D visualization.
 
