@@ -1,121 +1,159 @@
-# Counter Strike 2 Role Classification
+# CS2 Role Classifier
 
-This project attempts to infer player roles from gameplay data by extracting behavioral features from professional match demos and applying unsupervised clustering techniques.
+## Background
 
-Counter-Strike 2 (CS2) is a competitive, team-based first-person shooter where two teams of five players, Terrorists (T) and Counter-Terrorists (CT), compete in round-based matches. The T side aims to plant a bomb at designated bomb sites, then defend the bomb until detonation, while the CT side aims to prevent the bomb from being planted, or to defuse it. This game is very complex, and involves tactical positioning, smart utility usage of grenades, flashbangs, and smoke grenades, economic decision-making, and of course, mechanical shooting skill and teamwork.
+Counter-Strike 2 is a competitive, team-based first-person shooter where two teams of five, Terrorists (T) and Counter-Terrorists (CT), compete in round-based matches. The T side aims to plant a bomb at a designated site and defend it until detonation; the CT side aims to prevent the plant or defuse the bomb. At the highest level, the game involves tactical positioning, utility usage (grenades, flashbangs, smokes, molotovs), economic decision-making, and mechanical skill.
 
-Although all players share the same core mechanics, at the highest level of play, teams develop formal roles. Some are quite easy to define, like that of IGLs(In-Game Leaders), who make calls and captain the team, or the AWPer(the player who uses the AWP, the most powerful weapon in the game), who holds angles, punishes peeks, controls space. However, other roles, such as lurkers, anchors, entries, and support riflers, are much less well defined. 
+Although all players share the same mechanics, professional teams develop distinct roles. Some are easily defined:
 
-## Goal
+- **AWPer**: uses the AWP sniper rifle to hold angles, punish peeks, and control space
+- **IGL** (In-Game Leader): makes tactical calls and directs the team mid-round
 
-The goal is not to force players into the traditional rigid labels, but to test whether recognizable roles emerge from gameplay data.
+Others are far less well-defined: entry fraggers, lurkers, anchors, support riflers. The goal of this project is not to force players into rigid labels, but to test whether these archetypes emerge naturally from the data.
+
+## Pipeline
+
+```
+demos/
+  └─ *.dem
+       │
+       ▼
+ file_unzipper.py     Extract .rar archives from Downloads, deduplicate .dem files
+       │
+       ▼
+ demo_parser.py       Parse demos → per-player, per-side feature CSV
+       │
+       ▼
+ cluster_players.py   Run KMeans, GMM, HDBSCAN
+       │
+       ▼
+ plotter.py           PCA scatter plots, radar charts, silhouette vs k chart
+```
+
+Run the full pipeline end-to-end:
+```bash
+python main.py
+```
+
+Or run individual stages:
+```bash
+python file_unzipper.py
+python demo_parser.py <demos_dir> output.csv
+python cluster_players.py
+python plotter.py
+```
 
 ## Methods
 
-The pipeline consists of three main stages:
-1. CS2 demos are parsed using `awpy` to extract round-level and event-level data
-2. Data is aggregated across multiple demos by player
-3. A PCA is applied and 2 clustering algorithms(K-Means, GMM) are applied to try and group the players
+Three clustering algorithms are evaluated per side (CT and T separately):
 
+| Method | Notes |
+|---|---|
+| **KMeans** | k ∈ [2, 8], n_init=20 |
+| **GMM** | k ∈ [2, 8], full covariance |
+| **HDBSCAN** | grid search over min_cluster_size × min_samples; noise points excluded from scoring |
 
-## Results(WIP)
+Models are ranked by silhouette score then Davies-Bouldin index. The top 3 models per method per side are plotted.
 
-Some roles are easily recovered from this gameplay data
+Feature importance is printed after clustering using a `RandomForestClassifier` trained to predict cluster labels.
 
-- **AWPers** such as **broky**, **m0NESY**, and **SunPayus** are very easy to identify because of AWP-related features.
-- **IGLs** such as **karrigan**, **kyxsan**, and **apEX** appear much harder to identify from gameplay data, as a large portion of their impact comes from communication, mid-round calling, and team leadership rather than measurable in-game actions.
-- **Entry players** such as **donk**, **YEKINDAR**, and **EliGE** WIP
-- **Lurkers** such as **ropz**, **blameF**, and **Spinx** WIP
-- Some players are simply extreme outliers. A player like **ZywOo**, often considered one of the greatest Counter-Strike players of all time, may cluster unusually because his extremely high scores in many regions.
+PCA is computed once per side and reused across all models for consistent 2D visualization.
 
-## Usage
+## Data Schema
 
-python demo_parser.py --test outputs/test_output.csv
-
-python demo_parser.py --use-main-demos outputs/full_output.csv
-
-## Schema
-
-Data is stored in long format, where each row represents a player–side observation. All features are computed per player per side. Most features are normalized by rounds played, enabling comparison across demos of different lengths. 
+Output is in **long format**: one row per player per side. All rate features are normalized by rounds played.
 
 ### Identifiers
 
-| Feature         | Description                     |
-| --------------- | ------------------------------- |
-| **player_name** | Player identifier (categorical) |
-| **side**        | Team side (categorical: T / CT) |
+| Column | Description |
+|---|---|
+| `player_name` | Player identifier |
+| `side` | `ct` or `t` |
+| `rounds_played` | Rounds included for this player-side |
 
-### Generic 
+### Combat
 
-| Feature           | Description                       |
-| ----------------- | --------------------------------- |
-| **adr**           | Mean damage per round             |
-| **kpr**           | Mean kills per round              |
-| **survival_rate** | Fraction of rounds survived [0–1] |
+| Column | Description |
+|---|---|
+| `adr` | Average damage per round |
+| `kpr` | Kills per round |
+| `survival_rate` | Fraction of rounds survived |
+| `damage_per_round` | Mean damage dealt |
+| `damage_taken_per_round` | Mean damage received |
+| `damage_diff_per_round` | Net damage per round |
+| `assists_per_round` | Assists per round |
+| `multi_kill_rate` | Fraction of rounds with 2+ kills |
+| `rifle_kill_share` | Fraction of kills with rifles |
+| `awp_kill_share` | Fraction of kills with AWP |
 
+### Opening Duels
 
-### Combat output
-
-| Feature                    | Description                                    |
-| -------------------------- | ---------------------------------------------- |
-| **damage_per_round**       | Mean damage dealt per round                    |
-| **damage_taken_per_round** | Mean damage received per round                 |
-| **damage_diff_per_round**  | Mean net damage per round                      |
-| **assists_per_round**      | Mean assists per round                         |
-| **multi_kill_rate**        | Fraction of rounds with multiple kills `[0–1]` |
-| **rifle_kill_share**       | Fraction of kills with rifles `[0–1]`          |
-| **awp_kill_share**         | Fraction of kills with AWP `[0–1]`             |
-
-
-### Opening
-
-| Feature                  | Description                                      |
-| ------------------------ | ------------------------------------------------ |
-| **opening_kill_rate**    | Fraction of rounds with opening kill `[0–1]`     |
-| **opening_death_rate**   | Fraction of rounds with opening death `[0–1]`    |
-| **opening_duel_success** | Opening duel win rate `[0–1]`                    |
-| **first_contact_rate**   | Fraction of rounds with first engagement `[0–1]` |
+| Column | Description |
+|---|---|
+| `opening_kill_rate` | Fraction of rounds with an opening kill |
+| `opening_death_rate` | Fraction of rounds with an opening death |
+| `opening_duel_success` | Win rate in opening duels |
+| `first_contact_rate` | Fraction of rounds as first to engage enemy |
 
 ### Trading
-**Trading** refers to a kill that occurs shortly after a teammate’s death, where the killer eliminates the opponent responsible for that death within 5 seconds.
 
-| Feature                 | Description                                    |
-| ----------------------- | ---------------------------------------------- |
-| **trade_kill_rate**     | Fraction of kills that are trades* `[0–1]`      |
-| **death_traded_rate**   | Fraction of deaths traded by teammates `[0–1]` |
-| **trade_participation** | Fraction of trade involvement `[0–1]`          |
+A trade kill is defined as a kill that occurs within 5 seconds of a teammate's death, against the player who made that kill.
+
+| Column | Description |
+|---|---|
+| `trade_kill_rate` | Fraction of kills that are trades |
+| `death_traded_rate` | Fraction of deaths traded by teammates |
+| `trade_participation` | Combined trade involvement rate |
 
 ### Utility
 
-| Feature                     | Description                                     |
-| --------------------------- | ----------------------------------------------- |
-| **grenades_per_round**      | Mean grenades used per round                    |
-| **he_grenades_per_round**   | Mean HE grenades used per round                 |
-| **flashbangs_per_round**    | Mean flashbangs used per round                  |
-| **smokes_per_round**        | Mean smokes used per round                      |
-| **fire_nades_per_round**    | Mean molotov/incendiary grenades used per round |
-| **decoys_per_round**        | Mean decoys used per round                      |
-| **flash_assists_per_round** | Mean flash assists per round                    |
-| **util_damage_per_round**   | Mean damage dealt via utility                   |
+| Column | Description |
+|---|---|
+| `grenades_per_round` | Total grenades per round |
+| `he_grenades_per_round` | HE grenades per round |
+| `flashbangs_per_round` | Flashbangs per round |
+| `smokes_per_round` | Smokes per round |
+| `fire_nades_per_round` | Molotovs/incendiaries per round |
+| `decoys_per_round` | Decoys per round |
+| `flash_assists_per_round` | Flash assists per round |
+| `util_damage_per_round` | Damage dealt via utility |
 
-### Movement and Positioning
+### Positioning and Movement
 
-| Feature                              | Description                            |
-| ------------------------------------ | -------------------------------------- |
-| **avg_distance_to_enemy**            | Mean distance to nearest enemy         |
-| **avg_distance_to_team_centroid**    | Mean distance to team centroid         |
-| **relative_team_centroid_distance**  | Normalized distance from team centroid |
-| **avg_distance_moved_per_round**     | Mean distance traveled per round       |
-| **avg_distance_to_closest_teammate** | Mean distance to nearest teammate      |
-| **time_near_enemy_rate**             | Fraction of time near enemies `[0–1]`  |
-| **time_stationary_rate**             | Fraction of time stationary `[0–1]`    |
+| Column | Description |
+|---|---|
+| `avg_distance_to_enemy` | Mean distance to nearest enemy |
+| `avg_distance_to_team_centroid` | Mean distance to team centroid |
+| `relative_team_centroid_distance` | Distance to centroid, normalized by team spread |
+| `avg_distance_moved_per_round` | Total distance traveled per round |
+| `avg_distance_to_closest_teammate` | Mean distance to nearest teammate |
+| `time_near_enemy_rate` | Fraction of ticks within 750 units of an enemy |
+| `time_stationary_rate` | Fraction of ticks with movement ≤ 1 unit |
+
+### Consistency (std columns)
+
+For players with multiple demos, a `{feature}_std` column is computed alongside each rate feature, capturing game-to-game variance. A player with high `awp_kill_share` but high `awp_kill_share_std` may be a situational or secondary AWPer; low std may indicate a dedicated role.
+
+Std columns are only non-zero when more than one demo is parsed.
+
+## Results (WIP)
+
+Some roles recover cleanly from this data:
+
+- **AWPers** — broky, m0NESY, SunPayus cluster together reliably due to `awp_kill_share` and related features
+- **IGLs** — karrigan, kyxsan, apEX are harder to identify; their primary impact comes from communication and mid-round calling rather than measurable in-game actions
+- **Entry fraggers** — donk, YEKINDAR, EliGE (WIP)
+- **Lurkers** — ropz, blameF, Spinx (WIP)
+- **Outliers** — players like ZywOo, who scores extremely high across many features, may cluster as their own category rather than fitting a recognizable role archetype
 
 ## Dataset
 
-The dataset consists of professional CS2 match demos collected from HLTV.org and parsed using `awpy`.
+Professional CS2 match demos from HLTV.org, parsed using [`awpy`](https://github.com/pnxenopoulos/awpy).
 
-### Notes
+Currently using demos from **IEM Rio 2026**. Planned expansion to IEM Cologne Major 2026, IEM Atlanta 2026,  PGL Astana 2026, and CS Asia Championship 2026, a period with limited roster changes due to transfer locks.
 
-- The dataset consists of all matches played during IEM Rio 2026.
-- All features are computed directly from parsed demo data.
-- Player statistics are aggregated across multiple matches to reduce variance.
+## Dependencies
+
+```bash
+pip install awpy polars pandas scikit-learn hdbscan xgboost matplotlib
+```
