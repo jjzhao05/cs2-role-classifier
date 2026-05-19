@@ -12,8 +12,11 @@ import hdbscan
 INPUT_PATH = "output.csv"
 OUTPUT_DIR = Path("outputs")
 MIN_ROUNDS_PLAYED = 26
-K_VALUES = [2, 3, 4, 5, 6, 7, 8]
+K_VALUES = [3, 4, 5, 6, 7, 8]
 RANDOM_STATE = 69420
+
+# Features excluded from clustering but kept in the output CSV for plotting.
+CLUSTER_EXCLUDE_FEATURES = {"adr", "kpr"}
 
 # HDBSCAN hyperparameter grid
 HDBSCAN_MIN_CLUSTER_SIZES = [3, 5, 10, 15]
@@ -43,7 +46,7 @@ def load_data():
 
 
 def get_features(df):
-    exclude = {"player_name", "side", "rounds_played"}
+    exclude = {"player_name", "side", "rounds_played"} | CLUSTER_EXCLUDE_FEATURES
     X = df.drop(columns=[c for c in exclude if c in df.columns])
     X = X.apply(pd.to_numeric, errors="coerce").fillna(0)
     X = X.loc[:, X.nunique() > 1]
@@ -351,16 +354,21 @@ def cluster_side(df, side):
                       "stability_mean", "stability_std", "composite_score"]
     results_df[stability_cols].to_csv(side_dir / "stability_scores.csv", index=False)
 
-    for _, row in best_models.iterrows():
-        name = row["name"]
-        labels = methods[name]
-        output = side_df.copy()
-        output["cluster"] = labels
-        output["pc1"] = coords[:, 0]
-        output["pc2"] = coords[:, 1]
-        output.to_csv(side_dir / f"{name}_player_clusters.csv", index=False)
-
-    best_models.to_csv(side_dir / "best_models.csv", index=False)
+    # Player-level cluster assignments — write top 2 per algorithm so the
+    # plotter can select top-N per algorithm without missing CSVs.
+    TOP_N_PER_ALGO = 2
+    for method_name, group in results_df.groupby("method"):
+        top = group.head(TOP_N_PER_ALGO)
+        for _, row in top.iterrows():
+            name = row["name"]
+            if name not in methods:
+                continue
+            labels = methods[name]
+            output = side_df.copy()
+            output["cluster"] = labels
+            output["pc1"] = coords[:, 0]
+            output["pc2"] = coords[:, 1]
+            output.to_csv(side_dir / f"{name}_player_clusters.csv", index=False)
 
     # --- Console summary ---
     print(f"\n{side.upper()} analysis complete")
@@ -403,7 +411,11 @@ def cluster_side(df, side):
 
 def _print_stability_interpretation(results_df: pd.DataFrame) -> None:
     """Print a human-readable stability tier summary to the console."""
-    stab = results_df[["name", "stability_mean", "stability_std"]].dropna()
+    stab = (
+        results_df[["name", "stability_mean", "stability_std"]]
+        .dropna()
+        .sort_values("stability_mean", ascending=False)
+    )
     if stab.empty:
         return
 

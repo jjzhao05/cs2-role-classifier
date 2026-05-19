@@ -18,7 +18,7 @@ STATIONARY_STEP_DISTANCE = 1.0
 # Number of worker processes for parallel demo parsing.
 # Defaults to all logical CPU cores; lower this if memory is tight
 # (each worker loads a full demo into memory simultaneously).
-WORKERS = os.cpu_count() or 1
+WORKERS = 6
     
 TEAM_ALIASES = {
     "t": "t",

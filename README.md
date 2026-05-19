@@ -1,5 +1,9 @@
 # CS2 Role Classifier
 
+## Motivation
+
+I have followed professional Counter-Strike for years and have always been interested in how teams structure themselves around player roles. Analysts and fans often describe players as entries, lurkers, anchors, support players, or many other roles, but many of these labels were informal and difficult to define quantitatively. This project started as a way to explore whether those role archetypes could emerge naturally from gameplay data rather than being manually assigned. It also gave me an opportunity to work with demo parsing, feature engineering, clustering methods, and large-scale match data from an esport I genuinely enjoy watching and following.
+
 ## Background
 
 Counter-Strike 2 is a competitive, team-based first-person shooter where two teams of five, Terrorists (T) and Counter-Terrorists (CT), compete in round-based matches. The T side aims to plant a bomb at a designated site and defend it until detonation; the CT side aims to prevent the plant or defuse the bomb. At the highest level, the game involves tactical positioning, utility usage (grenades, flashbangs, smokes, molotovs), economic decision-making, and mechanical skill.
@@ -150,7 +154,8 @@ Some roles recover cleanly from this data:
 
 Professional CS2 match demos from HLTV.org, parsed using [`awpy`](https://github.com/pnxenopoulos/awpy).
 
-Currently using demos from **IEM Rio 2026**. Planned expansion to IEM Cologne Major 2026, IEM Atlanta 2026,  PGL Astana 2026, and CS Asia Championship 2026, a period with limited roster changes due to transfer locks.
+Currently using 320 players from 176 demos from **IEM Atlanta 2026** and **PGL Astana 2026**, with planned expansion to include the **IEM Cologne Major 2026** and **CS Asia Championship 2026**. 
+This time period was selected because these were high level events took place after the IEM Cologne Major roster locks, meaning team rosters were expected to remain stable until the conclusion of the Major. This should provide more consistent data regarding player roles.
 
 ## Dependencies
 
